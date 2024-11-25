@@ -4,7 +4,7 @@ In this document, all remarkable changes are listed. Not mentioned are smaller c
 
 ## Unreleased
 
-- Nothing here yet...
+- added `SyncTestSession::current_frame()` and `SpectatorSession::current_frame()` to match the existing `P2PSession::current_frame()`
 
 ## 0.10.2
 
