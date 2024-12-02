@@ -229,15 +229,30 @@ impl<T: Config> SyncLayer<T> {
 
     /// Loads the gamestate indicated by `frame_to_load`.
     pub(crate) fn load_frame(&mut self, frame_to_load: Frame) -> GgrsRequest<T> {
-        // The state should not be the current state or the state should not be in the future or too far away in the past
+        trace!(
+            "About to load cell for frame {} (current frame {})",
+            frame_to_load,
+            self.current_frame,
+        );
+
+        assert!(frame_to_load != NULL_FRAME, "cannot load null frame");
         assert!(
-            frame_to_load != NULL_FRAME
-                && frame_to_load < self.current_frame
-                && frame_to_load >= self.current_frame - self.max_prediction as i32
+            frame_to_load < self.current_frame,
+            // loading current frame would be a no-op and only wastes time
+            "shouldn't load current or future frame"
+        );
+        assert!(
+            frame_to_load >= self.current_frame - self.max_prediction as i32,
+            // trying to load past prediction range would cause saved states to wrap around
+            "frame to load must be in prediction range"
         );
 
         let cell = self.saved_states.get_cell(frame_to_load);
-        assert_eq!(cell.0.lock().frame, frame_to_load);
+        assert_eq!(
+            cell.0.lock().frame,
+            frame_to_load,
+            "Saved gamestate frame (left) should match frame to load (right)"
+        );
         self.current_frame = frame_to_load;
 
         GgrsRequest::LoadGameState {
