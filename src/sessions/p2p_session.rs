@@ -299,7 +299,11 @@ impl<T: Config> P2PSession<T> {
         let first_incorrect = self
             .sync_layer
             .check_simulation_consistency(self.disconnect_frame);
-        if first_incorrect != NULL_FRAME {
+        // if we have an incorrect frame, we need to rollback - but we can disregard the case where
+        // the incorrect frame is the current frame because we haven't actually advanced the current
+        // frame yet (the only way that happens is if self.disconnect_frame == the current frame).
+        if first_incorrect != NULL_FRAME && first_incorrect != self.sync_layer.current_frame() {
+            trace!("Found first incorrect frame of {}", first_incorrect);
             self.adjust_gamestate(first_incorrect, confirmed_frame, &mut requests);
             self.disconnect_frame = NULL_FRAME;
         }
@@ -371,10 +375,22 @@ impl<T: Config> P2PSession<T> {
          * ADVANCE THE STATE
          */
 
-        let frames_ahead = self.sync_layer.current_frame() - self.sync_layer.last_confirmed_frame();
-        if self.sync_layer.current_frame() < self.max_prediction as i32
-            || frames_ahead <= self.max_prediction as i32
-        {
+        let can_advance = if self.max_prediction == 0 {
+            // lockstep mode: only advance if the current frame has inputs confirmed from all other
+            // players.
+            self.sync_layer.last_confirmed_frame() == self.sync_layer.current_frame()
+        } else {
+            // rollback mode: advance as long as we aren't past our prediction window
+            let frames_ahead = if self.sync_layer.last_confirmed_frame() == NULL_FRAME {
+                // we haven't had any frames confirmed, so all frames we've advanced are "ahead"
+                self.sync_layer.current_frame()
+            } else {
+                // we're not at the first frame, so we have to subtract the last confirmed frame
+                self.sync_layer.current_frame() - self.sync_layer.last_confirmed_frame()
+            };
+            frames_ahead < self.max_prediction as i32
+        };
+        if can_advance {
             // get correct inputs for the current frame
             let inputs = self
                 .sync_layer
