@@ -38,6 +38,7 @@ pub(crate) mod network {
     pub(crate) mod protocol;
     pub(crate) mod udp_socket;
 }
+pub(crate) mod logging;
 
 // #############
 // # CONSTANTS #

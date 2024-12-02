@@ -1,5 +1,6 @@
 use crate::error::GgrsError;
 use crate::frame_info::PlayerInput;
+use crate::logging::*;
 use crate::network::messages::ConnectionStatus;
 use crate::network::network_stats::NetworkStats;
 use crate::network::protocol::{UdpProtocol, MAX_CHECKSUM_HISTORY_SIZE};
@@ -259,6 +260,7 @@ impl<T: Config> P2PSession<T> {
 
         // session is not running and synchronized
         if self.state != SessionState::Running {
+            trace!("Session not synchronized; returning error");
             return Err(GgrsError::NotSynchronized);
         }
 
@@ -266,7 +268,9 @@ impl<T: Config> P2PSession<T> {
         for handle in self.player_reg.local_player_handles() {
             if !self.local_inputs.contains_key(&handle) {
                 return Err(GgrsError::InvalidRequest {
-                    info: "Missing local input while calling advance_frame().".to_owned(),
+                    info: format!(
+                        "Missing local input for handle {handle} while calling advance_frame()."
+                    ),
                 });
             }
         }
@@ -280,6 +284,7 @@ impl<T: Config> P2PSession<T> {
 
         // if we are in the first frame, we have to save the state
         if self.sync_layer.current_frame() == 0 {
+            trace!("Saving state of first frame");
             requests.push(self.sync_layer.save_current_state());
         }
 
@@ -380,7 +385,7 @@ impl<T: Config> P2PSession<T> {
             self.local_inputs.clear();
             requests.push(GgrsRequest::AdvanceFrame { inputs });
         } else {
-            println!(
+            debug!(
                 "Prediction Threshold reached. Skipping on frame {}",
                 self.sync_layer.current_frame()
             );
@@ -663,6 +668,10 @@ impl<T: Config> P2PSession<T> {
         let count = current_frame - frame_to_load;
 
         // request to load that frame
+        debug!(
+            "Pushing request to load frame {} (current frame {})",
+            frame_to_load, current_frame
+        );
         requests.push(self.sync_layer.load_frame(frame_to_load));
 
         // we are now at the desired frame
