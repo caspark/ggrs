@@ -374,7 +374,7 @@ impl<T: Config> P2PSession<T> {
          * ADVANCE THE STATE
          */
 
-        let can_advance = if self.max_prediction == 0 {
+        let can_advance = if self.is_running_in_lockstep() {
             // lockstep mode: only advance if the current frame has inputs confirmed from all other
             // players.
             self.sync_layer.last_confirmed_frame() == self.sync_layer.current_frame()
@@ -544,6 +544,14 @@ impl<T: Config> P2PSession<T> {
     /// Returns the maximum prediction window of a session.
     pub fn max_prediction(&self) -> usize {
         self.max_prediction
+    }
+
+    /// Returns true if the session is running in lockstep mode.
+    ///
+    /// In lockstep mode, a session will only advance if the current frame has inputs confirmed from
+    /// all other players.
+    fn is_running_in_lockstep(&mut self) -> bool {
+        self.max_prediction == 0
     }
 
     /// Returns the current [`SessionState`] of a session.

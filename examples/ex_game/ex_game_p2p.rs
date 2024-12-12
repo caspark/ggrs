@@ -45,8 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_desync_detection_mode(ggrs::DesyncDetection::On { interval: 100 })
         // (optional) set expected update frequency
         .with_fps(FPS as usize)?
-        // secret trick: set the prediction to 0 to fall back to lockstep netcode
-        //.with_max_prediction_window(0)
+        // (optional) customize prediction window, which is how many frames ahead GGRS predicts.
+        // Or set the prediction window to 0 to fall back to lockstep netcode (with no rollbacks).
+        .with_max_prediction_window(8)
         // (optional) set input delay for the local player
         .with_input_delay(2);
 
