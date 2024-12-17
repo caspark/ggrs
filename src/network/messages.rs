@@ -17,16 +17,6 @@ impl Default for ConnectionStatus {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub(crate) struct SyncRequest {
-    pub random_request: u32, // please reply back with this random data
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub(crate) struct SyncReply {
-    pub random_reply: u32, // here's your random data back
-}
-
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Input {
     pub peer_connect_status: Vec<ConnectionStatus>,
@@ -108,8 +98,6 @@ pub(crate) struct MessageHeader {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MessageBody {
-    SyncRequest(SyncRequest),
-    SyncReply(SyncReply),
     Input(Input),
     InputAck(InputAck),
     QualityReport(QualityReport),

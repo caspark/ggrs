@@ -91,17 +91,6 @@ impl<A: Clone + PartialEq + Eq + Hash> Default for PlayerType<A> {
     }
 }
 
-/// A session is always in one of these states. You can query the current state of a session via [`current_state`].
-///
-/// [`current_state`]: P2PSession#method.current_state
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum SessionState {
-    /// When synchronizing, the session attempts to establish a connection to the remote clients.
-    Synchronizing,
-    /// When running, the session has synchronized and is ready to take and transmit player input.
-    Running,
-}
-
 /// [`InputStatus`] will always be given together with player inputs when requested to advance the frame.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum InputStatus {
@@ -119,20 +108,6 @@ pub enum GgrsEvent<T>
 where
     T: Config,
 {
-    /// The session made progress in synchronizing. After `total` roundtrips, the session are synchronized.
-    Synchronizing {
-        /// The address of the endpoint.
-        addr: T::Address,
-        /// Total number of required successful synchronization steps.
-        total: u32,
-        /// Current number of successful synchronization steps.
-        count: u32,
-    },
-    /// The session is now synchronized with the remote client.
-    Synchronized {
-        /// The address of the endpoint.
-        addr: T::Address,
-    },
     /// The remote client has disconnected.
     Disconnected {
         /// The address of the endpoint.

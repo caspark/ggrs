@@ -2,8 +2,8 @@ use std::net::SocketAddr;
 
 use bytemuck::{Pod, Zeroable};
 use ggrs::{
-    Config, Frame, GameStateCell, GgrsRequest, InputPredictor, InputStatus, PlayerHandle,
-    RepeatLastInputPredictor, NULL_FRAME,
+    Config, Frame, GameStateCell, GgrsRequest, InputStatus, PlayerHandle, RepeatLastInputPredictor,
+    NULL_FRAME,
 };
 use macroquad::prelude::*;
 use serde::{Deserialize, Serialize};

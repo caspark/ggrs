@@ -1,7 +1,7 @@
 mod ex_game;
 
 use ex_game::{GGRSConfig, Game};
-use ggrs::{GgrsError, GgrsEvent, SessionBuilder, SessionState, UdpNonBlockingSocket};
+use ggrs::{GgrsError, GgrsEvent, SessionBuilder, UdpNonBlockingSocket};
 use instant::{Duration, Instant};
 use macroquad::prelude::*;
 use std::net::SocketAddr;
@@ -76,17 +76,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             accumulator = accumulator.saturating_sub(Duration::from_secs_f64(fps_delta));
 
             // execute a frame
-            if sess.current_state() == SessionState::Running {
-                match sess.advance_frame() {
-                    Ok(requests) => game.handle_requests(requests),
-                    Err(GgrsError::PredictionThreshold) => {
-                        println!(
-                            "Frame {} skipped: Waiting for input from host.",
-                            game.current_frame()
-                        );
-                    }
-                    Err(e) => return Err(Box::new(e)),
+            match sess.advance_frame() {
+                Ok(requests) => game.handle_requests(requests),
+                Err(GgrsError::PredictionThreshold) => {
+                    println!(
+                        "Frame {} skipped: Waiting for input from host.",
+                        game.current_frame()
+                    );
                 }
+                Err(e) => return Err(Box::new(e)),
             }
         }
 

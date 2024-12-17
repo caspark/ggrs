@@ -1,6 +1,7 @@
 use std::collections::{vec_deque::Drain, VecDeque};
 
 use crate::{
+    error::NetworkStatsError,
     frame_info::PlayerInput,
     network::{
         messages::ConnectionStatus,
@@ -8,7 +9,7 @@ use crate::{
     },
     sessions::builder::MAX_EVENT_QUEUE_SIZE,
     Config, Frame, GgrsError, GgrsEvent, GgrsRequest, InputStatus, NetworkStats, NonBlockingSocket,
-    SessionState, NULL_FRAME,
+    NULL_FRAME,
 };
 
 // The amount of frames the spectator advances in a single step if not too far behind
@@ -23,7 +24,6 @@ pub struct SpectatorSession<T>
 where
     T: Config,
 {
-    state: SessionState,
     num_players: usize,
     inputs: Vec<Vec<PlayerInput<T::Input>>>,
     host_connect_status: Vec<ConnectionStatus>,
@@ -54,7 +54,6 @@ impl<T: Config> SpectatorSession<T> {
         }
 
         Self {
-            state: SessionState::Synchronizing,
             num_players,
             inputs: vec![
                 vec![PlayerInput::blank_input(NULL_FRAME); num_players];
@@ -71,11 +70,6 @@ impl<T: Config> SpectatorSession<T> {
         }
     }
 
-    /// Returns the current [`SessionState`] of a session.
-    pub fn current_state(&self) -> SessionState {
-        self.state
-    }
-
     /// Returns the number of frames behind the host
     pub fn frames_behind_host(&self) -> usize {
         let diff = self.last_recv_frame - self.current_frame;
@@ -88,7 +82,7 @@ impl<T: Config> SpectatorSession<T> {
     /// - Returns [`NotSynchronized`] if the session is not connected to other clients yet.
     ///
     /// [`NotSynchronized`]: GgrsError::NotSynchronized
-    pub fn network_stats(&self) -> Result<NetworkStats, GgrsError> {
+    pub fn network_stats(&self) -> Result<NetworkStats, NetworkStatsError> {
         self.host.network_stats()
     }
 
@@ -109,10 +103,6 @@ impl<T: Config> SpectatorSession<T> {
     pub fn advance_frame(&mut self) -> Result<Vec<GgrsRequest<T>>, GgrsError> {
         // receive info from host, trigger events and send messages
         self.poll_remote_clients();
-
-        if self.state != SessionState::Running {
-            return Err(GgrsError::NotSynchronized);
-        }
 
         let mut requests = Vec::new();
 
@@ -209,11 +199,6 @@ impl<T: Config> SpectatorSession<T> {
     fn handle_event(&mut self, event: Event<T>, addr: T::Address) {
         match event {
             // forward to user
-            Event::Synchronizing { total, count } => {
-                self.event_queue
-                    .push_back(GgrsEvent::Synchronizing { addr, total, count });
-            }
-            // forward to user
             Event::NetworkInterrupted { disconnect_timeout } => {
                 self.event_queue.push_back(GgrsEvent::NetworkInterrupted {
                     addr,
@@ -224,11 +209,6 @@ impl<T: Config> SpectatorSession<T> {
             Event::NetworkResumed => {
                 self.event_queue
                     .push_back(GgrsEvent::NetworkResumed { addr });
-            }
-            // synced with the host, then forward to user
-            Event::Synchronized => {
-                self.state = SessionState::Running;
-                self.event_queue.push_back(GgrsEvent::Synchronized { addr });
             }
             // disconnect the player, then forward to user
             Event::Disconnected => {
