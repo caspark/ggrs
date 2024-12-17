@@ -115,7 +115,7 @@ pub struct StateStub {
 impl StateStub {
     fn advance_frame(&mut self, inputs: Vec<(StubInput, InputStatus)>) {
         let p0_inputs = inputs[0].0.inp;
-        let p1_inputs = inputs[1].0.inp;
+        let p1_inputs = inputs.get(1).map(|i| i.0.inp).unwrap_or_default();
 
         if (p0_inputs + p1_inputs) % 2 == 0 {
             self.state += 2;

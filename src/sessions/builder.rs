@@ -317,7 +317,7 @@ impl<T: Config> SessionBuilder<T> {
         socket: impl NonBlockingSocket<T::Address> + 'static,
     ) -> SpectatorSession<T> {
         // create host endpoint
-        let mut host = UdpProtocol::new(
+        let host = UdpProtocol::new(
             (0..self.num_players).collect(),
             host_addr,
             self.num_players,
@@ -328,7 +328,6 @@ impl<T: Config> SessionBuilder<T> {
             self.fps,
             DesyncDetection::Off,
         );
-        host.synchronize();
         SpectatorSession::new(
             self.num_players,
             Box::new(socket),
@@ -364,8 +363,7 @@ impl<T: Config> SessionBuilder<T> {
         peer_addr: T::Address,
         local_players: usize,
     ) -> UdpProtocol<T> {
-        // create the endpoint, set parameters
-        let mut endpoint = UdpProtocol::new(
+        UdpProtocol::new(
             handles,
             peer_addr,
             self.num_players,
@@ -375,9 +373,6 @@ impl<T: Config> SessionBuilder<T> {
             self.disconnect_notify_start,
             self.fps,
             self.desync_detection,
-        );
-        // start the synchronization
-        endpoint.synchronize();
-        endpoint
+        )
     }
 }

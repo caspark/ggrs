@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
 use ggrs::{
-    Config, Frame, GameStateCell, GgrsRequest, InputPredictor, InputStatus, PlayerHandle,
-    PredictRepeatLast, NULL_FRAME,
+    Config, Frame, GameStateCell, GgrsRequest, InputStatus, PlayerHandle, PredictRepeatLast,
+    NULL_FRAME,
 };
 use macroquad::prelude::*;
 use serde::{Deserialize, Serialize};

@@ -1,28 +1,25 @@
+use crate::error::NetworkStatsError;
 use crate::frame_info::PlayerInput;
 use crate::network::compression::{decode, encode};
 use crate::network::messages::{
     ChecksumReport, ConnectionStatus, Input, InputAck, Message, MessageBody, MessageHeader,
-    QualityReply, QualityReport, SyncReply, SyncRequest,
+    QualityReply, QualityReport,
 };
 use crate::time_sync::TimeSync;
-use crate::{
-    Config, DesyncDetection, Frame, GgrsError, NonBlockingSocket, PlayerHandle, NULL_FRAME,
-};
+use crate::{Config, DesyncDetection, Frame, NonBlockingSocket, PlayerHandle, NULL_FRAME};
 use tracing::trace;
 
 use instant::{Duration, Instant};
 use std::collections::vec_deque::Drain;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::convert::TryFrom;
 use std::ops::Add;
 
 use super::network_stats::NetworkStats;
 
 const UDP_HEADER_SIZE: usize = 28; // Size of IP + UDP headers
-const NUM_SYNC_PACKETS: u32 = 5;
 const UDP_SHUTDOWN_TIMER: u64 = 5000;
 const PENDING_OUTPUT_SIZE: usize = 128;
-const SYNC_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 const RUNNING_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(200);
 const QUALITY_REPORT_INTERVAL: Duration = Duration::from_millis(200);
@@ -103,10 +100,6 @@ pub(crate) enum Event<T>
 where
     T: Config,
 {
-    /// The session is currently synchronizing with the remote client. It will continue until `count` reaches `total`.
-    Synchronizing { total: u32, count: u32 },
-    /// The session is now synchronized with the remote client.
-    Synchronized,
     /// The session has received an input from the remote client. This event will not be forwarded to the user.
     Input {
         input: PlayerInput<T::Input>,
@@ -122,8 +115,6 @@ where
 
 #[derive(Debug, PartialEq, Eq)]
 enum ProtocolState {
-    Initializing,
-    Synchronizing,
     Running,
     Disconnected,
     Shutdown,
@@ -140,8 +131,6 @@ where
 
     // state
     state: ProtocolState,
-    sync_remaining_roundtrips: u32,
-    sync_random_requests: HashSet<u32>,
     running_last_quality_report: Instant,
     running_last_input_recv: Instant,
     disconnect_notify_sent: bool,
@@ -156,7 +145,7 @@ where
 
     // the other client
     peer_addr: T::Address,
-    remote_magic: u16,
+    // remote_magic: u16,
     peer_connect_status: Vec<ConnectionStatus>,
 
     // input compression
@@ -226,9 +215,7 @@ impl<T: Config> UdpProtocol<T> {
             event_queue: VecDeque::new(),
 
             // state
-            state: ProtocolState::Initializing,
-            sync_remaining_roundtrips: NUM_SYNC_PACKETS,
-            sync_random_requests: HashSet::new(),
+            state: ProtocolState::Running,
             running_last_quality_report: Instant::now(),
             running_last_input_recv: Instant::now(),
             disconnect_notify_sent: false,
@@ -243,7 +230,6 @@ impl<T: Config> UdpProtocol<T> {
 
             // the other client
             peer_addr,
-            remote_magic: 0,
             peer_connect_status,
 
             // input compression
@@ -258,7 +244,7 @@ impl<T: Config> UdpProtocol<T> {
             remote_frame_advantage: 0,
 
             // network
-            stats_start_time: 0,
+            stats_start_time: millis_since_epoch(),
             packets_sent: 0,
             bytes_sent: 0,
             round_trip_time: 0,
@@ -282,15 +268,15 @@ impl<T: Config> UdpProtocol<T> {
         self.local_frame_advantage = remote_frame - local_frame;
     }
 
-    pub(crate) fn network_stats(&self) -> Result<NetworkStats, GgrsError> {
-        if self.state != ProtocolState::Synchronizing && self.state != ProtocolState::Running {
-            return Err(GgrsError::NotSynchronized);
+    pub(crate) fn network_stats(&self) -> Result<NetworkStats, NetworkStatsError> {
+        if self.state != ProtocolState::Running {
+            return Err(NetworkStatsError::Unavailable);
         }
 
         let now = millis_since_epoch();
         let seconds = (now - self.stats_start_time) / 1000;
         if seconds == 0 {
-            return Err(GgrsError::NotSynchronized);
+            return Err(NetworkStatsError::Unavailable);
         }
 
         let total_bytes_sent = self.bytes_sent + (self.packets_sent * UDP_HEADER_SIZE);
@@ -308,12 +294,6 @@ impl<T: Config> UdpProtocol<T> {
 
     pub(crate) fn handles(&self) -> &Vec<PlayerHandle> {
         &self.handles
-    }
-
-    pub(crate) fn is_synchronized(&self) -> bool {
-        self.state == ProtocolState::Running
-            || self.state == ProtocolState::Disconnected
-            || self.state == ProtocolState::Shutdown
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -338,14 +318,6 @@ impl<T: Config> UdpProtocol<T> {
         self.shutdown_timeout = Instant::now().add(Duration::from_millis(UDP_SHUTDOWN_TIMER))
     }
 
-    pub(crate) fn synchronize(&mut self) {
-        assert_eq!(self.state, ProtocolState::Initializing);
-        self.state = ProtocolState::Synchronizing;
-        self.sync_remaining_roundtrips = NUM_SYNC_PACKETS;
-        self.stats_start_time = millis_since_epoch();
-        self.send_sync_request();
-    }
-
     pub(crate) fn average_frame_advantage(&self) -> i32 {
         self.time_sync_layer.average_frame_advantage()
     }
@@ -357,12 +329,6 @@ impl<T: Config> UdpProtocol<T> {
     pub(crate) fn poll(&mut self, connect_status: &[ConnectionStatus]) -> Drain<Event<T>> {
         let now = Instant::now();
         match self.state {
-            ProtocolState::Synchronizing => {
-                // some time has passed, let us send another sync request
-                if self.last_send_time + SYNC_RETRY_INTERVAL < now {
-                    self.send_sync_request();
-                }
-            }
             ProtocolState::Running => {
                 // resend pending inputs, if some time has passed without sending or receiving inputs
                 if self.running_last_input_recv + RUNNING_RETRY_INTERVAL < now {
@@ -404,7 +370,7 @@ impl<T: Config> UdpProtocol<T> {
                     self.state = ProtocolState::Shutdown;
                 }
             }
-            ProtocolState::Initializing | ProtocolState::Shutdown => (),
+            ProtocolState::Shutdown => (),
         }
         self.event_queue.drain(..)
     }
@@ -529,15 +495,6 @@ impl<T: Config> UdpProtocol<T> {
         self.queue_message(MessageBody::KeepAlive);
     }
 
-    fn send_sync_request(&mut self) {
-        let random_number = rand::random::<u32>();
-        self.sync_random_requests.insert(random_number);
-        let body = SyncRequest {
-            random_request: random_number,
-        };
-        self.queue_message(MessageBody::SyncRequest(body));
-    }
-
     fn send_quality_report(&mut self) {
         self.running_last_quality_report = Instant::now();
         let body = QualityReport {
@@ -580,12 +537,6 @@ impl<T: Config> UdpProtocol<T> {
             return;
         }
 
-        // filter packets that don't match the magic if we have set it already
-        if self.remote_magic != 0 && msg.header.magic != self.remote_magic {
-            trace!("Received message with wrong magic; ignoring");
-            return;
-        }
-
         // update time when we last received packages
         self.last_recv_time = Instant::now();
 
@@ -598,53 +549,12 @@ impl<T: Config> UdpProtocol<T> {
 
         // handle the message
         match &msg.body {
-            MessageBody::SyncRequest(body) => self.on_sync_request(*body),
-            MessageBody::SyncReply(body) => self.on_sync_reply(msg.header, *body),
             MessageBody::Input(body) => self.on_input(body),
             MessageBody::InputAck(body) => self.on_input_ack(*body),
             MessageBody::QualityReport(body) => self.on_quality_report(body),
             MessageBody::QualityReply(body) => self.on_quality_reply(body),
             MessageBody::ChecksumReport(body) => self.on_checksum_report(body),
             MessageBody::KeepAlive => (),
-        }
-    }
-
-    /// Upon receiving a `SyncRequest`, answer with a `SyncReply` with the proper data
-    fn on_sync_request(&mut self, body: SyncRequest) {
-        let reply_body = SyncReply {
-            random_reply: body.random_request,
-        };
-        self.queue_message(MessageBody::SyncReply(reply_body));
-    }
-
-    /// Upon receiving a `SyncReply`, check validity and either continue the synchronization process or conclude synchronization.
-    fn on_sync_reply(&mut self, header: MessageHeader, body: SyncReply) {
-        // ignore sync replies when not syncing
-        if self.state != ProtocolState::Synchronizing {
-            return;
-        }
-        // this is not the correct reply
-        if !self.sync_random_requests.remove(&body.random_reply) {
-            return;
-        }
-        // the sync reply is good, so we send a sync request again until we have finished the required roundtrips. Then, we can conclude the syncing process.
-        self.sync_remaining_roundtrips -= 1;
-        if self.sync_remaining_roundtrips > 0 {
-            // register an event
-            let evt = Event::Synchronizing {
-                total: NUM_SYNC_PACKETS,
-                count: NUM_SYNC_PACKETS - self.sync_remaining_roundtrips,
-            };
-            self.event_queue.push_back(evt);
-            // send another sync request
-            self.send_sync_request();
-        } else {
-            // switch to running state
-            self.state = ProtocolState::Running;
-            // register an event
-            self.event_queue.push_back(Event::Synchronized);
-            // the remote endpoint is now "authorized"
-            self.remote_magic = header.magic;
         }
     }
 
