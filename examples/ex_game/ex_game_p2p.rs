@@ -1,7 +1,7 @@
 mod ex_game;
 
 use ex_game::{GGRSConfig, Game};
-use ggrs::{PlayerType, SessionBuilder, SessionState, UdpNonBlockingSocket};
+use ggrs::{PlayerType, SessionBuilder, UdpNonBlockingSocket};
 use instant::{Duration, Instant};
 use macroquad::prelude::*;
 use std::net::SocketAddr;
@@ -84,8 +84,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // start the GGRS session
+    info!("binding to port");
     let socket = UdpNonBlockingSocket::bind_to_port(opt.local_port)?;
+    info!("binding to port done");
     let mut sess = sess_build.start_p2p_session(socket)?;
+    info!("session created");
 
     // Create a new box game
     let mut game = Game::new(num_players);
@@ -121,17 +124,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // decrease accumulator
             accumulator = accumulator.saturating_sub(Duration::from_secs_f64(fps_delta));
 
-            // frames are only happening if the sessions are synchronized
-            if sess.current_state() == SessionState::Running {
-                // add input for all local  players
-                for handle in sess.local_player_handles() {
-                    sess.add_local_input(handle, game.local_input(handle))?;
-                }
+            // add input for all local  players
+            for handle in sess.local_player_handles() {
+                sess.add_local_input(handle, game.local_input(handle))?;
+            }
 
-                match sess.advance_frame() {
-                    Ok(requests) => game.handle_requests(requests, sess.in_lockstep_mode()),
-                    Err(e) => return Err(Box::new(e)),
-                }
+            match sess.advance_frame() {
+                Ok(requests) => game.handle_requests(requests, sess.in_lockstep_mode()),
+                Err(e) => return Err(Box::new(e)),
             }
         }
 

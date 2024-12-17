@@ -1,8 +1,7 @@
 mod stubs;
 
 use ggrs::{
-    DesyncDetection, GgrsError, GgrsEvent, PlayerType, SessionBuilder, SessionState,
-    UdpNonBlockingSocket,
+    DesyncDetection, GgrsError, GgrsEvent, PlayerType, SessionBuilder, UdpNonBlockingSocket,
 };
 use serial_test::serial;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -67,38 +66,6 @@ fn test_disconnect_player() -> Result<(), GgrsError> {
 
 #[test]
 #[serial]
-fn test_synchronize_p2p_sessions() -> Result<(), GgrsError> {
-    let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 7777);
-    let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8888);
-
-    let socket1 = UdpNonBlockingSocket::bind_to_port(7777).unwrap();
-    let mut sess1 = SessionBuilder::<StubConfig>::new()
-        .add_player(PlayerType::Local, 0)?
-        .add_player(PlayerType::Remote(addr2), 1)?
-        .start_p2p_session(socket1)?;
-
-    let socket2 = UdpNonBlockingSocket::bind_to_port(8888).unwrap();
-    let mut sess2 = SessionBuilder::<StubConfig>::new()
-        .add_player(PlayerType::Local, 1)?
-        .add_player(PlayerType::Remote(addr1), 0)?
-        .start_p2p_session(socket2)?;
-
-    assert!(sess1.current_state() == SessionState::Synchronizing);
-    assert!(sess2.current_state() == SessionState::Synchronizing);
-
-    for _ in 0..50 {
-        sess1.poll_remote_clients();
-        sess2.poll_remote_clients();
-    }
-
-    assert!(sess1.current_state() == SessionState::Running);
-    assert!(sess2.current_state() == SessionState::Running);
-
-    Ok(())
-}
-
-#[test]
-#[serial]
 fn test_advance_frame_p2p_sessions() -> Result<(), GgrsError> {
     let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 7777);
     let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8888);
@@ -115,16 +82,10 @@ fn test_advance_frame_p2p_sessions() -> Result<(), GgrsError> {
         .add_player(PlayerType::Local, 1)?
         .start_p2p_session(socket2)?;
 
-    assert!(sess1.current_state() == SessionState::Synchronizing);
-    assert!(sess2.current_state() == SessionState::Synchronizing);
-
     for _ in 0..50 {
         sess1.poll_remote_clients();
         sess2.poll_remote_clients();
     }
-
-    assert!(sess1.current_state() == SessionState::Running);
-    assert!(sess2.current_state() == SessionState::Running);
 
     let mut stub1 = stubs::GameStub::new();
     let mut stub2 = stubs::GameStub::new();
@@ -169,18 +130,7 @@ fn test_desyncs_detected() -> Result<(), GgrsError> {
         .with_desync_detection_mode(desync_mode)
         .start_p2p_session(socket2)?;
 
-    while sess1.current_state() != SessionState::Running
-        && sess2.current_state() != SessionState::Running
-    {
-        sess1.poll_remote_clients();
-        sess2.poll_remote_clients();
-    }
-
-    // drain events
-    assert!(sess1.events().chain(sess2.events()).all(|e| match e {
-        GgrsEvent::Synchronizing { .. } | GgrsEvent::Synchronized { .. } => true,
-        _ => false,
-    }));
+    assert!(sess1.events().chain(sess2.events()).next().is_none());
 
     let mut stub1 = stubs::GameStub::new();
     let mut stub2 = stubs::GameStub::new();
@@ -284,19 +234,6 @@ fn test_desyncs_and_input_delay_no_panic() -> Result<(), GgrsError> {
         .with_input_delay(5)
         .with_desync_detection_mode(desync_mode)
         .start_p2p_session(socket2)?;
-
-    while sess1.current_state() != SessionState::Running
-        && sess2.current_state() != SessionState::Running
-    {
-        sess1.poll_remote_clients();
-        sess2.poll_remote_clients();
-    }
-
-    // drain events
-    assert!(sess1.events().chain(sess2.events()).all(|e| match e {
-        GgrsEvent::Synchronizing { .. } | GgrsEvent::Synchronized { .. } => true,
-        _ => false,
-    }));
 
     let mut stub1 = stubs::GameStub::new();
     let mut stub2 = stubs::GameStub::new();

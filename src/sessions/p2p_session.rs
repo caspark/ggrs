@@ -1,13 +1,14 @@
-use crate::error::GgrsError;
+use crate::error::{GgrsError, NetworkStatsError};
 use crate::frame_info::PlayerInput;
 use crate::network::messages::ConnectionStatus;
 use crate::network::network_stats::NetworkStats;
 use crate::network::protocol::{UdpProtocol, MAX_CHECKSUM_HISTORY_SIZE};
 use crate::sync_layer::SyncLayer;
 use crate::DesyncDetection;
+use crate::SessionState;
 use crate::{
     network::protocol::Event, Config, Frame, GgrsEvent, GgrsRequest, NonBlockingSocket,
-    PlayerHandle, PlayerType, SessionState, NULL_FRAME,
+    PlayerHandle, PlayerType, NULL_FRAME,
 };
 use tracing::{debug, trace, warn};
 
@@ -130,9 +131,6 @@ where
     /// If we receive a disconnect from another client, we have to rollback from that frame on in order to prevent wrong predictions
     disconnect_frame: Frame,
 
-    /// Internal State of the Session.
-    state: SessionState,
-
     /// The [`P2PSession`] uses this socket to send and receive all messages for remote players.
     socket: Box<dyn NonBlockingSocket<T::Address>>,
     /// Handles players and their endpoints
@@ -186,13 +184,6 @@ impl<T: Config> P2PSession<T> {
             }
         }
 
-        // initial session state - if there are no endpoints, we don't need a synchronization phase
-        let state = if players.remotes.len() + players.spectators.len() == 0 {
-            SessionState::Running
-        } else {
-            SessionState::Synchronizing
-        };
-
         let sparse_saving = if max_prediction == 0 && sparse_saving {
             // in lockstep mode, saving will never happen, but we use the last saved frame to mark
             // control marking frames confirmed, so we need to turn off sparse saving to ensure that
@@ -207,7 +198,6 @@ impl<T: Config> P2PSession<T> {
         };
 
         Self {
-            state,
             num_players,
             max_prediction,
             sparse_saving,
@@ -256,6 +246,11 @@ impl<T: Config> P2PSession<T> {
         Ok(())
     }
 
+    /// Returns the current [`SessionState`] of a session.
+    pub fn current_state(&self) -> SessionState {
+        SessionState::Running
+    }
+
     /// You should call this to notify GGRS that you are ready to advance your gamestate by a single frame.
     /// Returns an order-sensitive [`Vec<GgrsRequest>`]. You should fulfill all requests in the exact order they are provided.
     /// Failure to do so will cause panics later.
@@ -270,12 +265,6 @@ impl<T: Config> P2PSession<T> {
     pub fn advance_frame(&mut self) -> Result<Vec<GgrsRequest<T>>, GgrsError> {
         // receive info from remote players, trigger events and send messages
         self.poll_remote_clients();
-
-        // session is not running and synchronized
-        if self.state != SessionState::Running {
-            trace!("Session not synchronized; returning error");
-            return Err(GgrsError::NotSynchronized);
-        }
 
         // check if input for all local players is queued
         for handle in self.player_reg.local_player_handles() {
@@ -526,7 +515,10 @@ impl<T: Config> P2PSession<T> {
     ///
     /// [`InvalidRequest`]: GgrsError::InvalidRequest
     /// [`NotSynchronized`]: GgrsError::NotSynchronized
-    pub fn network_stats(&self, player_handle: PlayerHandle) -> Result<NetworkStats, GgrsError> {
+    pub fn network_stats(
+        &self,
+        player_handle: PlayerHandle,
+    ) -> Result<NetworkStats, NetworkStatsError> {
         match self.player_reg.handles.get(&player_handle) {
             Some(PlayerType::Remote(addr)) => self
                 .player_reg
@@ -538,12 +530,9 @@ impl<T: Config> P2PSession<T> {
                 .player_reg
                 .remotes
                 .get(addr)
-                .expect("Endpoint should exist for any registered player")
+                .expect("Endpoint should exist for any registered spectator")
                 .network_stats(),
-            _ => Err(GgrsError::InvalidRequest {
-                info: "Given player handle not referring to a remote player or spectator"
-                    .to_owned(),
-            }),
+            _ => Err(NetworkStatsError::BadPlayerHandle),
         }
     }
 
@@ -577,11 +566,6 @@ impl<T: Config> P2PSession<T> {
     /// all other players.
     pub fn in_lockstep_mode(&mut self) -> bool {
         self.max_prediction == 0
-    }
-
-    /// Returns the current [`SessionState`] of a session.
-    pub fn current_state(&self) -> SessionState {
-        self.state
     }
 
     /// Returns all events that happened since last queried for events. If the number of stored events exceeds `MAX_EVENT_QUEUE_SIZE`, the oldest events will be discarded.
@@ -666,32 +650,6 @@ impl<T: Config> P2PSession<T> {
             }
             PlayerType::Local => (),
         }
-
-        // check if all remotes are synchronized now
-        self.check_initial_sync();
-    }
-
-    /// Change the session state to [`SessionState::Running`] if all UDP endpoints are synchronized.
-    fn check_initial_sync(&mut self) {
-        // if we are not synchronizing, we don't need to do anything
-        if self.state != SessionState::Synchronizing {
-            return;
-        }
-
-        // if any endpoint is not synchronized, we continue synchronizing
-        for endpoint in self.player_reg.remotes.values_mut() {
-            if !endpoint.is_synchronized() {
-                return;
-            }
-        }
-        for endpoint in self.player_reg.spectators.values_mut() {
-            if !endpoint.is_synchronized() {
-                return;
-            }
-        }
-
-        // everyone is synchronized, so we can change state and accept input
-        self.state = SessionState::Running;
     }
 
     /// Roll back to `min_confirmed` frame and resimulate the game with most up-to-date input data.
@@ -891,11 +849,6 @@ impl<T: Config> P2PSession<T> {
     ) {
         match event {
             // forward to user
-            Event::Synchronizing { total, count } => {
-                self.event_queue
-                    .push_back(GgrsEvent::Synchronizing { addr, total, count });
-            }
-            // forward to user
             Event::NetworkInterrupted { disconnect_timeout } => {
                 self.event_queue.push_back(GgrsEvent::NetworkInterrupted {
                     addr,
@@ -906,11 +859,6 @@ impl<T: Config> P2PSession<T> {
             Event::NetworkResumed => {
                 self.event_queue
                     .push_back(GgrsEvent::NetworkResumed { addr });
-            }
-            // check if all remotes are synced, then forward to user
-            Event::Synchronized => {
-                self.check_initial_sync();
-                self.event_queue.push_back(GgrsEvent::Synchronized { addr });
             }
             // disconnect the player, then forward to user
             Event::Disconnected => {
