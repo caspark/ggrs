@@ -1,11 +1,11 @@
 use crate::error::{GgrsError, NetworkStatsError};
 use crate::frame_info::PlayerInput;
-use crate::logging::*;
 use crate::network::messages::ConnectionStatus;
 use crate::network::network_stats::NetworkStats;
 use crate::network::protocol::{UdpProtocol, MAX_CHECKSUM_HISTORY_SIZE};
 use crate::sync_layer::SyncLayer;
 use crate::DesyncDetection;
+use crate::{logging::*, SessionState};
 use crate::{
     network::protocol::Event, Config, Frame, GgrsEvent, GgrsRequest, NonBlockingSocket,
     PlayerHandle, PlayerType, NULL_FRAME,
@@ -230,6 +230,11 @@ impl<T: Config> P2PSession<T> {
         let player_input = PlayerInput::<T::Input>::new(self.sync_layer.current_frame(), input);
         self.local_inputs.insert(player_handle, player_input);
         Ok(())
+    }
+
+    /// Returns the current [`SessionState`] of a session.
+    pub fn current_state(&self) -> SessionState {
+        SessionState::Running
     }
 
     /// You should call this to notify GGRS that you are ready to advance your gamestate by a single frame.

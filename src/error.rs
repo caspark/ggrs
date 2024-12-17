@@ -48,6 +48,8 @@ pub enum GgrsError {
         /// The frames with mismatched checksums (one or more)
         mismatched_frames: Vec<Frame>,
     },
+    /// The Session is not synchronized yet. Please start the session and wait a few ms to let the clients synchronize.
+    NotSynchronized,
     /// The spectator got so far behind the host that catching up is impossible.
     SpectatorTooFarBehind,
 }
@@ -63,6 +65,12 @@ impl Display for GgrsError {
             }
             GgrsError::InvalidRequest { info } => {
                 write!(f, "Invalid Request: {}", info)
+            }
+            GgrsError::NotSynchronized => {
+                write!(
+                    f,
+                    "The session is not yet synchronized with all remote sessions."
+                )
             }
             GgrsError::MismatchedChecksum {
                 current_frame,
