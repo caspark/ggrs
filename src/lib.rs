@@ -208,7 +208,7 @@ pub trait Config: 'static + Send + Sync {
     ///
     /// The implementation of [Default] is used for representing "no input" for
     /// a player, including when a player is disconnected.
-    type Input: Copy + Clone + PartialEq + Default + Serialize + DeserializeOwned + Send + Sync;
+    type Input: Clone + PartialEq + Default + Serialize + DeserializeOwned + Send + Sync;
 
     /// How GGRS should predict the next input for a player when their input hasn't arrived yet.
     ///
@@ -247,7 +247,7 @@ pub trait Config: 'static {
     ///
     /// The implementation of [Default] is used for representing "no input" for
     /// a player, including when a player is disconnected.
-    type Input: Copy + Clone + PartialEq + Default + Serialize + DeserializeOwned;
+    type Input: Clone + PartialEq + Default + Serialize + DeserializeOwned;
 
     /// How GGRS should predict the next input for a player when their input hasn't arrived yet.
     ///
@@ -378,8 +378,7 @@ pub trait InputPredictor<I> {
     /// remote player has been received in this session yet (notably, the very first simulation of
     /// the first frame of a session will never have any inputs from remote players). In such a case
     /// GGRS will use [I::default()](Default::default) instead of calling the predictor.
-    ///
-    fn predict(previous: I) -> I;
+    fn predict(previous: &I) -> I;
 }
 
 /// An [InputPredictor] that predicts that the next input for any player will be identical to the
@@ -387,9 +386,9 @@ pub trait InputPredictor<I> {
 ///
 /// This is a good default choice, and a sane starting point for any custom input prediction logic.
 pub struct PredictRepeatLast;
-impl<I> InputPredictor<I> for PredictRepeatLast {
-    fn predict(previous: I) -> I {
-        previous
+impl<I: Clone> InputPredictor<I> for PredictRepeatLast {
+    fn predict(previous: &I) -> I {
+        previous.clone()
     }
 }
 
@@ -401,7 +400,7 @@ impl<I> InputPredictor<I> for PredictRepeatLast {
 /// state) for a concrete example.
 pub struct PredictDefault;
 impl<I: Default> InputPredictor<I> for PredictDefault {
-    fn predict(_previous: I) -> I {
+    fn predict(_previous: &I) -> I {
         I::default()
     }
 }

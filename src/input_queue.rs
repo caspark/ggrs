@@ -72,7 +72,7 @@ impl<T: Config> InputQueue<T> {
         let offset = requested_frame as usize % INPUT_QUEUE_LENGTH;
 
         if self.inputs[offset].frame == requested_frame {
-            return self.inputs[offset];
+            return self.inputs[offset].clone();
         }
 
         // the requested confirmed input should not be before a prediction. We should not have asked for a known incorrect frame.
@@ -120,7 +120,7 @@ impl<T: Config> InputQueue<T> {
             if offset < self.length {
                 offset = (offset + self.tail) % INPUT_QUEUE_LENGTH;
                 assert!(self.inputs[offset].frame == requested_frame);
-                return (self.inputs[offset].input, InputStatus::Confirmed);
+                return (self.inputs[offset].input.clone(), InputStatus::Confirmed);
             }
 
             // The requested frame isn't in the queue. This means we need to return a prediction frame.
@@ -134,13 +134,17 @@ impl<T: Config> InputQueue<T> {
                         0 => INPUT_QUEUE_LENGTH - 1,
                         _ => self.head - 1,
                     };
-                    Some(self.inputs[previous_position])
+                    Some(
+                        self.inputs
+                            .get(previous_position)
+                            .expect("prediction must be in range"),
+                    )
                 };
 
             // Ask the user to predict the input based on the previous input (if any); if we don't
             // get a prediction from the user, default to the default input.
             let input_prediction = previous_player_input
-                .map(|pi| T::InputPredictor::predict(pi.input))
+                .map(|pi| T::InputPredictor::predict(&pi.input))
                 .unwrap_or_default();
 
             // Set the frame number of the predicted input to what it was based on
@@ -159,8 +163,7 @@ impl<T: Config> InputQueue<T> {
 
         // We must be predicting, so we return the prediction frame contents. We are adjusting the prediction to have the requested frame.
         assert!(self.prediction.frame != NULL_FRAME);
-        let prediction_to_return = self.prediction; // PlayerInput has copy semantics
-        (prediction_to_return.input, InputStatus::Predicted)
+        (self.prediction.input.clone(), InputStatus::Predicted)
     }
 
     /// Adds an input frame to the queue. Will consider the set frame delay.
@@ -193,6 +196,9 @@ impl<T: Config> InputQueue<T> {
         assert!(self.last_added_frame == NULL_FRAME || frame_number == self.last_added_frame + 1);
         assert!(frame_number == 0 || self.inputs[previous_position].frame == frame_number - 1);
 
+        // check whether prediction matches input before we move input into the queue
+        let prediction_matches_input = self.prediction.equal(&input, true);
+
         // Add the frame to the back of the queue
         self.inputs[self.head] = input;
         self.inputs[self.head].frame = frame_number;
@@ -207,7 +213,7 @@ impl<T: Config> InputQueue<T> {
             assert!(frame_number == self.prediction.frame);
 
             // Remember the first input which was incorrect so we can report it
-            if self.first_incorrect_frame == NULL_FRAME && !self.prediction.equal(&input, true) {
+            if self.first_incorrect_frame == NULL_FRAME && !prediction_matches_input {
                 self.first_incorrect_frame = frame_number;
             }
 
@@ -245,7 +251,7 @@ impl<T: Config> InputQueue<T> {
         // This can occur when the frame delay has been increased since the last time we shoved a frame into the system.
         // We need to replicate the last frame in the queue several times in order to fill the space left.
         while expected_frame < input_frame {
-            let input_to_replicate = self.inputs[previous_position];
+            let input_to_replicate = self.inputs[previous_position].clone();
             self.add_input_by_frame(input_to_replicate, expected_frame);
             expected_frame += 1;
         }

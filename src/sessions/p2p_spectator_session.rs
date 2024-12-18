@@ -188,9 +188,9 @@ impl<T: Config> SpectatorSession<T> {
                 if self.host_connect_status[handle].disconnected
                     && self.host_connect_status[handle].last_frame < frame_to_grab
                 {
-                    (player_input.input, InputStatus::Disconnected)
+                    (player_input.input.clone(), InputStatus::Disconnected)
                 } else {
-                    (player_input.input, InputStatus::Confirmed)
+                    (player_input.input.clone(), InputStatus::Confirmed)
                 }
             })
             .collect())
@@ -217,12 +217,13 @@ impl<T: Config> SpectatorSession<T> {
             // add the input and all associated information
             Event::Input { input, player } => {
                 // save the input
-                self.inputs[input.frame as usize % SPECTATOR_BUFFER_SIZE][player] = input;
+                let input_idx = input.frame as usize % SPECTATOR_BUFFER_SIZE;
                 assert!(input.frame >= self.last_recv_frame);
                 self.last_recv_frame = input.frame;
+                self.inputs[input_idx][player] = input;
 
                 // update the frame advantage
-                self.host.update_local_frame_advantage(input.frame);
+                self.host.update_local_frame_advantage(self.last_recv_frame);
 
                 // update the host connection status
                 for i in 0..self.num_players {

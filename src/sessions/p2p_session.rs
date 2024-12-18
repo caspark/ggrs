@@ -368,7 +368,9 @@ impl<T: Config> P2PSession<T> {
                 .get_mut(&handle)
                 .expect("Missing local input while calling advance_frame().");
             // send the input into the sync layer
-            let actual_frame = self.sync_layer.add_local_input(handle, *player_input);
+            let actual_frame = self
+                .sync_layer
+                .add_local_input(handle, player_input.clone());
             player_input.frame = actual_frame;
             // if the input has not been dropped
             if actual_frame != NULL_FRAME {
@@ -377,7 +379,7 @@ impl<T: Config> P2PSession<T> {
         }
 
         // if the local inputs have not been dropped by the sync layer, send to all remote clients
-        if !self.local_inputs.values().any(|&i| i.frame == NULL_FRAME) {
+        if !self.local_inputs.values().any(|i| i.frame == NULL_FRAME) {
             for endpoint in self.player_reg.remotes.values_mut() {
                 endpoint.send_input(&self.local_inputs, &self.local_connect_status);
                 endpoint.send_all_messages(&mut self.socket);
@@ -726,7 +728,7 @@ impl<T: Config> P2PSession<T> {
             let mut input_map = HashMap::new();
             for (handle, input) in inputs.iter_mut().enumerate() {
                 assert!(input.frame == NULL_FRAME || input.frame == self.next_spectator_frame);
-                input_map.insert(handle, *input);
+                input_map.insert(handle, input.clone());
             }
 
             // send it to all spectators

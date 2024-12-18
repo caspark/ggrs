@@ -27,7 +27,7 @@ impl<S> Default for GameState<S> {
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) struct PlayerInput<I>
 where
-    I: Copy + Clone + PartialEq,
+    I: Clone + PartialEq,
 {
     /// The frame to which this info belongs to. -1/[`NULL_FRAME`] represents an invalid frame
     pub frame: Frame,
@@ -35,7 +35,7 @@ where
     pub input: I,
 }
 
-impl<I: Copy + Clone + PartialEq + Default> PlayerInput<I> {
+impl<I: Clone + PartialEq + Default> PlayerInput<I> {
     pub(crate) fn new(frame: Frame, input: I) -> Self {
         Self { frame, input }
     }
