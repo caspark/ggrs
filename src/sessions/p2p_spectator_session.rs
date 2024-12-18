@@ -25,7 +25,7 @@ where
     T: Config,
 {
     num_players: usize,
-    inputs: Vec<Vec<PlayerInput<T::Input>>>,
+    inputs: Vec<Vec<PlayerInput>>,
     host_connect_status: Vec<ConnectionStatus>,
     socket: Box<dyn NonBlockingSocket<T::Address>>,
     host: UdpProtocol<T>,
@@ -56,7 +56,7 @@ impl<T: Config> SpectatorSession<T> {
         Self {
             num_players,
             inputs: vec![
-                vec![PlayerInput::blank_input(NULL_FRAME); num_players];
+                vec![PlayerInput::new_blank_input::<T::Input>(NULL_FRAME); num_players];
                 SPECTATOR_BUFFER_SIZE
             ],
             host_connect_status,
@@ -185,18 +185,19 @@ impl<T: Config> SpectatorSession<T> {
             .iter()
             .enumerate()
             .map(|(handle, player_input)| {
+                let input = player_input.input.clone().decode::<T::Input>();
                 if self.host_connect_status[handle].disconnected
                     && self.host_connect_status[handle].last_frame < frame_to_grab
                 {
-                    (player_input.input.clone(), InputStatus::Disconnected)
+                    (input, InputStatus::Disconnected)
                 } else {
-                    (player_input.input.clone(), InputStatus::Confirmed)
+                    (input, InputStatus::Confirmed)
                 }
             })
             .collect())
     }
 
-    fn handle_event(&mut self, event: Event<T>, addr: T::Address) {
+    fn handle_event(&mut self, event: Event, addr: T::Address) {
         match event {
             // forward to user
             Event::NetworkInterrupted { disconnect_timeout } => {

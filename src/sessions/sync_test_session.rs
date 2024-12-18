@@ -18,7 +18,7 @@ where
     sync_layer: SyncLayer<T>,
     dummy_connect_status: Vec<ConnectionStatus>,
     checksum_history: HashMap<Frame, Option<u128>>,
-    local_inputs: HashMap<PlayerHandle, PlayerInput<T::Input>>,
+    local_inputs: HashMap<PlayerHandle, PlayerInput>,
 }
 
 impl<T: Config> SyncTestSession<T> {
@@ -68,7 +68,7 @@ impl<T: Config> SyncTestSession<T> {
                 info: "The player handle you provided is not valid.".to_owned(),
             });
         }
-        let player_input = PlayerInput::<T::Input>::new(self.sync_layer.current_frame(), input);
+        let player_input = PlayerInput::new_from_input(self.sync_layer.current_frame(), input);
         self.local_inputs.insert(player_handle, player_input);
         Ok(())
     }

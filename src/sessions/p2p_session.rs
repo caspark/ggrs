@@ -148,7 +148,7 @@ where
     /// Contains all events to be forwarded to the user.
     event_queue: VecDeque<GgrsEvent<T>>,
     /// Contains all local inputs not yet sent into the system. This should have inputs for every local player before calling advance_frame
-    local_inputs: HashMap<PlayerHandle, PlayerInput<T::Input>>,
+    local_inputs: HashMap<PlayerHandle, PlayerInput>,
 
     /// With desync detection, the session will compare checksums for all peers to detect discrepancies / desyncs between peers
     desync_detection: DesyncDetection,
@@ -241,7 +241,7 @@ impl<T: Config> P2PSession<T> {
                     .to_owned(),
             });
         }
-        let player_input = PlayerInput::<T::Input>::new(self.sync_layer.current_frame(), input);
+        let player_input = PlayerInput::new_from_input(self.sync_layer.current_frame(), input);
         self.local_inputs.insert(player_handle, player_input);
         Ok(())
     }
@@ -843,12 +843,7 @@ impl<T: Config> P2PSession<T> {
     }
 
     /// Handle events received from the UDP endpoints. Most events are being forwarded to the user for notification, but some require action.
-    fn handle_event(
-        &mut self,
-        event: Event<T>,
-        player_handles: Vec<PlayerHandle>,
-        addr: T::Address,
-    ) {
+    fn handle_event(&mut self, event: Event, player_handles: Vec<PlayerHandle>, addr: T::Address) {
         match event {
             // forward to user
             Event::NetworkInterrupted { disconnect_timeout } => {

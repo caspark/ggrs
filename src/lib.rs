@@ -20,6 +20,7 @@ pub use sessions::p2p_spectator_session::SpectatorSession;
 pub use sessions::sync_test_session::SyncTestSession;
 pub use sync_layer::{GameStateAccessor, GameStateCell};
 
+pub(crate) mod debug;
 pub(crate) mod error;
 pub(crate) mod frame_info;
 pub(crate) mod input_queue;
@@ -200,6 +201,16 @@ where
 
 //  special thanks to james7132 for the idea of a config trait that bundles all generics
 
+/// The input type for a session. This is the only game-related data transmitted over the network.
+///
+/// The implementation of [Default] is used for representing "no input" for a player, including when
+/// a player is disconnected.
+///
+/// Serialize and DeserializeOwned are used to send the data over the network, and to compare the
+/// inputs against predictions made.
+pub trait GgrsInput: Default + Serialize + DeserializeOwned {}
+impl<I: Default + Serialize + DeserializeOwned> GgrsInput for I {}
+
 /// Compile time parameterization for sessions.
 #[cfg(feature = "sync-send")]
 pub trait Config: 'static + Send + Sync {
@@ -208,7 +219,7 @@ pub trait Config: 'static + Send + Sync {
     ///
     /// The implementation of [Default] is used for representing "no input" for
     /// a player, including when a player is disconnected.
-    type Input: Clone + PartialEq + Default + Serialize + DeserializeOwned + Send + Sync;
+    type Input: GgrsInput + Send + Sync;
 
     /// How GGRS should predict the next input for a player when their input hasn't arrived yet.
     ///
@@ -247,7 +258,7 @@ pub trait Config: 'static {
     ///
     /// The implementation of [Default] is used for representing "no input" for
     /// a player, including when a player is disconnected.
-    type Input: Clone + PartialEq + Default + Serialize + DeserializeOwned;
+    type Input: GgrsInput;
 
     /// How GGRS should predict the next input for a player when their input hasn't arrived yet.
     ///

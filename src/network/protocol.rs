@@ -41,6 +41,7 @@ fn millis_since_epoch() -> u128 {
 }
 
 // byte-encoded data representing the inputs of a client, possibly for multiple players at the same time
+//FIXME it's a bit redundant to have both PlayerInputSerialized and InputBytes - should be able to scrap one of them
 #[derive(Clone)]
 struct InputBytes {
     /// The frame to which this info belongs to. -1/[`NULL_FRAME`] represents an invalid frame
@@ -58,10 +59,7 @@ impl InputBytes {
         }
     }
 
-    fn from_inputs<T: Config>(
-        num_players: usize,
-        inputs: &HashMap<PlayerHandle, PlayerInput<T::Input>>,
-    ) -> Self {
+    fn from_inputs(num_players: usize, inputs: &HashMap<PlayerHandle, PlayerInput>) -> Self {
         let mut bytes = Vec::new();
         let mut frame = NULL_FRAME;
         // in ascending order
@@ -72,14 +70,13 @@ impl InputBytes {
                     frame = input.frame;
                 }
 
-                bincode::serialize_into(&mut bytes, &input.input)
-                    .expect("input serialization failed");
+                bytes.extend_from_slice(input.input.as_slice());
             }
         }
         Self { frame, bytes }
     }
 
-    fn to_player_inputs<T: Config>(&self, num_players: usize) -> Vec<PlayerInput<T::Input>> {
+    fn to_player_inputs(&self, num_players: usize) -> Vec<PlayerInput> {
         let mut player_inputs = Vec::new();
         assert!(self.bytes.len() % num_players == 0);
         let size = self.bytes.len() / num_players;
@@ -87,22 +84,21 @@ impl InputBytes {
             let start = p * size;
             let end = start + size;
             let player_byte_slice = &self.bytes[start..end];
-            let input: T::Input =
-                bincode::deserialize(player_byte_slice).expect("input deserialization failed");
-            player_inputs.push(PlayerInput::new(self.frame, input));
+
+            player_inputs.push(PlayerInput::new_from_bytes(
+                self.frame,
+                player_byte_slice.to_vec(),
+            ));
         }
         player_inputs
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Event<T>
-where
-    T: Config,
-{
+pub(crate) enum Event {
     /// The session has received an input from the remote client. This event will not be forwarded to the user.
     Input {
-        input: PlayerInput<T::Input>,
+        input: PlayerInput,
         player: PlayerHandle,
     },
     /// The remote client has disconnected.
@@ -127,7 +123,7 @@ where
     num_players: usize,
     handles: Vec<PlayerHandle>,
     send_queue: VecDeque<Message>,
-    event_queue: VecDeque<Event<T>>,
+    event_queue: VecDeque<Event>,
 
     // state
     state: ProtocolState,
@@ -326,7 +322,7 @@ impl<T: Config> UdpProtocol<T> {
         self.peer_addr.clone()
     }
 
-    pub(crate) fn poll(&mut self, connect_status: &[ConnectionStatus]) -> Drain<Event<T>> {
+    pub(crate) fn poll(&mut self, connect_status: &[ConnectionStatus]) -> Drain<Event> {
         let now = Instant::now();
         match self.state {
             ProtocolState::Running => {
@@ -420,14 +416,14 @@ impl<T: Config> UdpProtocol<T> {
 
     pub(crate) fn send_input(
         &mut self,
-        inputs: &HashMap<PlayerHandle, PlayerInput<T::Input>>,
+        inputs: &HashMap<PlayerHandle, PlayerInput>,
         connect_status: &[ConnectionStatus],
     ) {
         if self.state != ProtocolState::Running {
             return;
         }
 
-        let endpoint_data = InputBytes::from_inputs::<T>(self.num_players, inputs);
+        let endpoint_data = InputBytes::from_inputs(self.num_players, inputs);
 
         // register the input and advantages in the time sync layer
         self.time_sync_layer.advance_frame(
@@ -612,7 +608,7 @@ impl<T: Config> UdpProtocol<T> {
                     bytes: inp,
                 };
                 // send the input to the session
-                let player_inputs = input_data.to_player_inputs::<T>(self.handles.len());
+                let player_inputs = input_data.to_player_inputs(self.handles.len());
                 self.recv_inputs.insert(input_data.frame, input_data);
 
                 for (i, player_input) in player_inputs.into_iter().enumerate() {

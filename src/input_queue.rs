@@ -1,5 +1,5 @@
-use crate::frame_info::PlayerInput;
-use crate::{Config, Frame, InputPredictor, InputStatus, NULL_FRAME};
+use crate::frame_info::{PlayerInput, SerializedPlayerInput};
+use crate::{Frame, GgrsInput, InputPredictor, InputStatus, NULL_FRAME};
 use std::cmp;
 
 /// The length of the input queue. This describes the number of inputs GGRS can hold at the same time per player.
@@ -7,10 +7,7 @@ const INPUT_QUEUE_LENGTH: usize = 128;
 
 /// `InputQueue` handles inputs for a single player and saves them in a circular array. Valid Inputs are between `head` and `tail`.
 #[derive(Debug, Clone)]
-pub(crate) struct InputQueue<T>
-where
-    T: Config,
-{
+pub(crate) struct InputQueue {
     /// The head of the queue. The newest `PlayerInput` is saved here
     head: usize,
     /// The tail of the queue. The oldest `PlayerInput` still valid is saved here.
@@ -31,13 +28,13 @@ where
     frame_delay: usize,
 
     /// Our cyclic input queue
-    inputs: Vec<PlayerInput<T::Input>>,
+    inputs: Vec<PlayerInput>,
     /// A pre-allocated prediction we are going to use to return predictions from.
-    prediction: PlayerInput<T::Input>,
+    prediction: PlayerInput,
 }
 
-impl<T: Config> InputQueue<T> {
-    pub(crate) fn new() -> Self {
+impl InputQueue {
+    pub(crate) fn new<I: GgrsInput>() -> Self {
         Self {
             head: 0,
             tail: 0,
@@ -47,8 +44,8 @@ impl<T: Config> InputQueue<T> {
             last_added_frame: NULL_FRAME,
             first_incorrect_frame: NULL_FRAME,
             last_requested_frame: NULL_FRAME,
-            prediction: PlayerInput::blank_input(NULL_FRAME),
-            inputs: vec![PlayerInput::blank_input(NULL_FRAME); INPUT_QUEUE_LENGTH],
+            prediction: PlayerInput::new_blank_input::<I>(NULL_FRAME),
+            inputs: vec![PlayerInput::new_blank_input::<I>(NULL_FRAME); INPUT_QUEUE_LENGTH],
         }
     }
 
@@ -68,7 +65,7 @@ impl<T: Config> InputQueue<T> {
 
     /// Returns a `PlayerInput`, but only if the input for the requested frame is confirmed.
     /// In contrast to `input()`, this will not return a prediction if there is no confirmed input for the frame, but panic instead.
-    pub(crate) fn confirmed_input(&self, requested_frame: Frame) -> PlayerInput<T::Input> {
+    pub(crate) fn confirmed_input(&self, requested_frame: Frame) -> PlayerInput {
         let offset = requested_frame as usize % INPUT_QUEUE_LENGTH;
 
         if self.inputs[offset].frame == requested_frame {
@@ -101,7 +98,10 @@ impl<T: Config> InputQueue<T> {
     }
 
     /// Returns the game input of a single player for a given frame, if that input does not exist, we return a prediction instead.
-    pub(crate) fn input(&mut self, requested_frame: Frame) -> (T::Input, InputStatus) {
+    pub(crate) fn input<I: GgrsInput, P: InputPredictor<I>>(
+        &mut self,
+        requested_frame: Frame,
+    ) -> (SerializedPlayerInput, InputStatus) {
         // No one should ever try to grab any input when we have a prediction error.
         // Doing so means that we're just going further down the wrong path. Assert this to verify that it's true.
         assert!(self.first_incorrect_frame == NULL_FRAME);
@@ -144,7 +144,10 @@ impl<T: Config> InputQueue<T> {
             // Ask the user to predict the input based on the previous input (if any); if we don't
             // get a prediction from the user, default to the default input.
             let input_prediction = previous_player_input
-                .map(|pi| T::InputPredictor::predict(&pi.input))
+                .map(|pi| {
+                    let decoded = pi.input.decode::<I>();
+                    P::predict(&decoded)
+                })
                 .unwrap_or_default();
 
             // Set the frame number of the predicted input to what it was based on
@@ -154,7 +157,7 @@ impl<T: Config> InputQueue<T> {
                 } else {
                     self.prediction.frame
                 };
-                PlayerInput::new(frame_num, input_prediction)
+                PlayerInput::new_from_input(frame_num, input_prediction)
             };
 
             // update the prediction's frame
@@ -167,7 +170,7 @@ impl<T: Config> InputQueue<T> {
     }
 
     /// Adds an input frame to the queue. Will consider the set frame delay.
-    pub(crate) fn add_input(&mut self, input: PlayerInput<T::Input>) -> Frame {
+    pub(crate) fn add_input(&mut self, input: PlayerInput) -> Frame {
         // Verify that inputs are passed in sequentially by the user, regardless of frame delay.
         if self.last_added_frame != NULL_FRAME
             && input.frame + self.frame_delay as i32 != self.last_added_frame + 1
@@ -187,7 +190,7 @@ impl<T: Config> InputQueue<T> {
 
     /// Adds an input frame to the queue at the given frame number. If there are predicted inputs, we will check those and mark them as incorrect, if necessary.
     /// Returns the frame number
-    fn add_input_by_frame(&mut self, input: PlayerInput<T::Input>, frame_number: Frame) {
+    fn add_input_by_frame(&mut self, input: PlayerInput, frame_number: Frame) {
         let previous_position = match self.head {
             0 => INPUT_QUEUE_LENGTH - 1,
             _ => self.head - 1,
@@ -272,8 +275,6 @@ impl<T: Config> InputQueue<T> {
 #[cfg(test)]
 mod input_queue_tests {
 
-    use std::net::SocketAddr;
-
     use serde::{Deserialize, Serialize};
 
     use crate::PredictRepeatLast;
@@ -286,37 +287,28 @@ mod input_queue_tests {
         inp: u8,
     }
 
-    struct TestConfig;
-
-    impl Config for TestConfig {
-        type Input = TestInput;
-        type InputPredictor = PredictRepeatLast;
-        type State = Vec<u8>;
-        type Address = SocketAddr;
-    }
-
     #[test]
     fn test_add_input_wrong_frame() {
-        let mut queue = InputQueue::<TestConfig>::new();
-        let input = PlayerInput::new(0, TestInput { inp: 0 });
+        let mut queue = InputQueue::new::<TestInput>();
+        let input = PlayerInput::new_from_input(0, TestInput { inp: 0 });
         assert_eq!(queue.add_input(input), 0); // fine
-        let input_wrong_frame = PlayerInput::new(3, TestInput { inp: 0 });
+        let input_wrong_frame = PlayerInput::new_from_input(3, TestInput { inp: 0 });
         assert_eq!(queue.add_input(input_wrong_frame), NULL_FRAME); // input dropped
     }
 
     #[test]
     fn test_add_input_twice() {
-        let mut queue = InputQueue::<TestConfig>::new();
-        let input = PlayerInput::new(0, TestInput { inp: 0 });
-        assert_eq!(queue.add_input(input), 0); // fine
+        let mut queue = InputQueue::new::<TestInput>();
+        let input = PlayerInput::new_from_input(0, TestInput { inp: 0 });
+        assert_eq!(queue.add_input(input.clone()), 0); // fine
         assert_eq!(queue.add_input(input), NULL_FRAME); // input dropped
     }
 
     #[test]
     fn test_add_input_sequentially() {
-        let mut queue = InputQueue::<TestConfig>::new();
+        let mut queue = InputQueue::new::<TestInput>();
         for i in 0..10 {
-            let input = PlayerInput::new(i, TestInput { inp: 0 });
+            let input = PlayerInput::new_from_input(i, TestInput { inp: 0 });
             queue.add_input(input);
             assert_eq!(queue.last_added_frame, i);
             assert_eq!(queue.length, (i + 1) as usize);
@@ -325,30 +317,30 @@ mod input_queue_tests {
 
     #[test]
     fn test_input_sequentially() {
-        let mut queue = InputQueue::<TestConfig>::new();
+        let mut queue = InputQueue::new::<TestInput>();
         for i in 0..10 {
-            let input = PlayerInput::new(i, TestInput { inp: i as u8 });
+            let input = PlayerInput::new_from_input(i, TestInput { inp: i as u8 });
             queue.add_input(input);
             assert_eq!(queue.last_added_frame, i);
             assert_eq!(queue.length, (i + 1) as usize);
-            let (input_in_queue, _status) = queue.input(i);
-            assert_eq!(input_in_queue.inp, i as u8);
+            let (input_in_queue, _status) = queue.input::<TestInput, PredictRepeatLast>(i);
+            assert_eq!(input_in_queue.decode::<TestInput>().inp, i as u8);
         }
     }
 
     #[test]
     fn test_delayed_inputs() {
-        let mut queue = InputQueue::<TestConfig>::new();
+        let mut queue = InputQueue::new::<TestInput>();
         let delay: i32 = 2;
         queue.set_frame_delay(delay as usize);
         for i in 0..10 {
-            let input = PlayerInput::new(i, TestInput { inp: i as u8 });
+            let input = PlayerInput::new_from_input(i, TestInput { inp: i as u8 });
             queue.add_input(input);
             assert_eq!(queue.last_added_frame, i + delay);
             assert_eq!(queue.length, (i + delay + 1) as usize);
-            let (input_in_queue, _status) = queue.input(i);
+            let (input_in_queue, _status) = queue.input::<TestInput, PredictRepeatLast>(i);
             let correct_input = std::cmp::max(0, i - delay) as u8;
-            assert_eq!(input_in_queue.inp, correct_input);
+            assert_eq!(input_in_queue.decode::<TestInput>().inp, correct_input);
         }
     }
 }

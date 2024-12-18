@@ -175,7 +175,7 @@ where
     last_confirmed_frame: Frame,
     last_saved_frame: Frame,
     current_frame: Frame,
-    input_queues: Vec<InputQueue<T>>,
+    input_queues: Vec<InputQueue>,
 }
 
 impl<T: Config> SyncLayer<T> {
@@ -184,7 +184,7 @@ impl<T: Config> SyncLayer<T> {
         // initialize input_queues
         let mut input_queues = Vec::new();
         for _ in 0..num_players {
-            input_queues.push(InputQueue::new());
+            input_queues.push(InputQueue::new::<T::Input>());
         }
         Self {
             num_players,
@@ -259,7 +259,7 @@ impl<T: Config> SyncLayer<T> {
     pub(crate) fn add_local_input(
         &mut self,
         player_handle: PlayerHandle,
-        input: PlayerInput<T::Input>,
+        input: PlayerInput,
     ) -> Frame {
         // The input provided should match the current frame, we account for input delay later
         assert_eq!(input.frame, self.current_frame);
@@ -268,11 +268,7 @@ impl<T: Config> SyncLayer<T> {
 
     /// Adds remote input to the corresponding input queue.
     /// Unlike `add_local_input`, this will not check for correct conditions, as remote inputs have already been checked on another device.
-    pub(crate) fn add_remote_input(
-        &mut self,
-        player_handle: PlayerHandle,
-        input: PlayerInput<T::Input>,
-    ) {
+    pub(crate) fn add_remote_input(&mut self, player_handle: PlayerHandle, input: PlayerInput) {
         self.input_queues[player_handle].add_input(input);
     }
 
@@ -286,7 +282,9 @@ impl<T: Config> SyncLayer<T> {
             if con_stat.disconnected && con_stat.last_frame < self.current_frame {
                 inputs.push((T::Input::default(), InputStatus::Disconnected));
             } else {
-                inputs.push(self.input_queues[i].input(self.current_frame));
+                let (serialized_input, input_status) =
+                    self.input_queues[i].input::<T::Input, T::InputPredictor>(self.current_frame);
+                inputs.push((serialized_input.decode::<T::Input>(), input_status));
             }
         }
         inputs
@@ -297,11 +295,11 @@ impl<T: Config> SyncLayer<T> {
         &self,
         frame: Frame,
         connect_status: &[ConnectionStatus],
-    ) -> Vec<PlayerInput<T::Input>> {
+    ) -> Vec<PlayerInput> {
         let mut inputs = Vec::new();
         for (i, con_stat) in connect_status.iter().enumerate() {
             if con_stat.disconnected && con_stat.last_frame < frame {
-                inputs.push(PlayerInput::blank_input(NULL_FRAME));
+                inputs.push(PlayerInput::new_blank_input::<T::Input>(NULL_FRAME));
             } else {
                 inputs.push(self.input_queues[i].confirmed_input(frame));
             }
@@ -414,10 +412,10 @@ mod sync_layer_tests {
         dummy_connect_status.push(ConnectionStatus::default());
 
         for i in 0..20 {
-            let game_input = PlayerInput::new(i, TestInput { inp: i as u8 });
+            let game_input = PlayerInput::new_from_input(i, TestInput { inp: i as u8 });
             // adding input as remote to avoid prediction threshold detection
-            sync_layer.add_remote_input(0, game_input);
-            sync_layer.add_remote_input(1, game_input);
+            sync_layer.add_remote_input(0, game_input.clone());
+            sync_layer.add_remote_input(1, game_input.clone());
             // update the dummy connect status
             dummy_connect_status[0].last_frame = i;
             dummy_connect_status[1].last_frame = i;
