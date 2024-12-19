@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use instant::Duration;
 
@@ -10,7 +10,6 @@ use crate::{
 
 use super::p2p_spectator_session::SPECTATOR_BUFFER_SIZE;
 
-const DEFAULT_PLAYERS: usize = 2;
 const DEFAULT_SAVE_MODE: bool = false;
 const DEFAULT_DETECTION_MODE: DesyncDetection = DesyncDetection::Off;
 const DEFAULT_INPUT_DELAY: usize = 0;
@@ -33,8 +32,6 @@ pub struct SessionBuilder<T>
 where
     T: Config,
 {
-    num_players: usize,
-    local_players: usize,
     max_prediction: usize,
     /// FPS defines the expected update frequency of this session.
     fps: usize,
@@ -62,8 +59,6 @@ impl<T: Config> SessionBuilder<T> {
     pub fn new() -> Self {
         Self {
             player_reg: PlayerRegistry::new(),
-            local_players: 0,
-            num_players: DEFAULT_PLAYERS,
             max_prediction: DEFAULT_MAX_PREDICTION_FRAMES,
             fps: DEFAULT_FPS,
             sparse_saving: DEFAULT_SAVE_MODE,
@@ -98,31 +93,6 @@ impl<T: Config> SessionBuilder<T> {
                 info: "Player handle already in use.".to_owned(),
             });
         }
-        // check if the player handle is valid for the given player type
-        match player_type {
-            PlayerType::Local => {
-                self.local_players += 1;
-                if player_handle >= self.num_players {
-                    return Err(GgrsError::InvalidRequest {
-                        info: "The player handle you provided is invalid. For a local player, the handle should be between 0 and num_players".to_owned(),
-                    });
-                }
-            }
-            PlayerType::Remote(_) => {
-                if player_handle >= self.num_players {
-                    return Err(GgrsError::InvalidRequest {
-                        info: "The player handle you provided is invalid. For a remote player, the handle should be between 0 and num_players".to_owned(),
-                    });
-                }
-            }
-            PlayerType::Spectator(_) => {
-                if player_handle < self.num_players {
-                    return Err(GgrsError::InvalidRequest {
-                        info: "The player handle you provided is invalid. For a spectator, the handle should be num_players or higher".to_owned(),
-                    });
-                }
-            }
-        }
         self.player_reg.handles.insert(player_handle, player_type);
         Ok(self)
     }
@@ -149,12 +119,6 @@ impl<T: Config> SessionBuilder<T> {
     /// Change the amount of frames GGRS will delay the inputs for local players.
     pub fn with_input_delay(mut self, delay: usize) -> Self {
         self.input_delay = delay;
-        self
-    }
-
-    /// Change number of total players. Default is 2.
-    pub fn with_num_players(mut self, num_players: usize) -> Self {
-        self.num_players = num_players;
         self
     }
 
@@ -256,40 +220,50 @@ impl<T: Config> SessionBuilder<T> {
         mut self,
         socket: impl NonBlockingSocket<T::Address> + 'static,
     ) -> Result<P2PSession<T>, GgrsError> {
-        // check if all players are added
-        for player_handle in 0..self.num_players {
-            if !self.player_reg.handles.contains_key(&player_handle) {
-                return Err(GgrsError::InvalidRequest{
-                    info: "Not enough players have been added. Keep registering players up to the defined player number.".to_owned(),
-                });
-            }
-        }
-
-        // count the number of players per address
-        let mut addr_count = HashMap::<PlayerType<T::Address>, Vec<PlayerHandle>>::new();
+        // group player handles by address
+        let mut addr_to_handles = HashMap::<PlayerType<T::Address>, BTreeSet<PlayerHandle>>::new();
         for (handle, player_type) in self.player_reg.handles.iter() {
             match player_type {
-                PlayerType::Remote(_) | PlayerType::Spectator(_) => addr_count
-                    .entry(player_type.clone())
-                    .or_insert_with(Vec::new)
-                    .push(*handle),
+                PlayerType::Remote(_) | PlayerType::Spectator(_) => {
+                    addr_to_handles
+                        .entry(player_type.clone())
+                        .or_default()
+                        .insert(*handle);
+                }
                 PlayerType::Local => (),
             }
         }
 
         // for each unique address, create an endpoint
-        for (player_type, handles) in addr_count.into_iter() {
+        let playing_players: BTreeSet<PlayerHandle> = self
+            .player_reg
+            .playing_player_handles()
+            .into_iter()
+            .collect();
+        for (player_type, address_handles) in addr_to_handles.into_iter() {
             match player_type {
                 PlayerType::Remote(peer_addr) => {
                     self.player_reg.remotes.insert(
                         peer_addr.clone(),
-                        self.create_endpoint(handles, peer_addr.clone(), self.local_players),
+                        self.create_endpoint(
+                            address_handles,
+                            peer_addr.clone(),
+                            playing_players.clone(),
+                            self.player_reg.local_player_handles().into_iter().collect(),
+                        ),
                     );
                 }
                 PlayerType::Spectator(peer_addr) => {
                     self.player_reg.spectators.insert(
                         peer_addr.clone(),
-                        self.create_endpoint(handles, peer_addr.clone(), self.num_players), // the host of the spectator sends inputs for all players
+                        self.create_endpoint(
+                            address_handles,
+                            peer_addr.clone(),
+                            playing_players.clone(),
+                            // the host of the spectator pretends all players are its own local
+                            // players so that it sends inputs for all players to the spectator
+                            playing_players.clone(),
+                        ),
                     );
                 }
                 PlayerType::Local => (),
@@ -297,7 +271,6 @@ impl<T: Config> SessionBuilder<T> {
         }
 
         Ok(P2PSession::<T>::new(
-            self.num_players,
             self.max_prediction,
             Box::new(socket),
             self.player_reg,
@@ -316,12 +289,19 @@ impl<T: Config> SessionBuilder<T> {
         host_addr: T::Address,
         socket: impl NonBlockingSocket<T::Address> + 'static,
     ) -> SpectatorSession<T> {
+        let playing_player_handles: BTreeSet<PlayerHandle> = self
+            .player_reg
+            .playing_player_handles()
+            .into_iter()
+            .collect();
         // create host endpoint
         let host = UdpProtocol::new(
-            (0..self.num_players).collect(),
+            // as far as the spectator is concerned, all players are local to the host, so it
+            // expects the host to send inputs for all players on this endpoint
+            playing_player_handles.clone(),
             host_addr,
-            self.num_players,
-            1, //should not matter since the spectator is never sending
+            playing_player_handles.clone(),
+            [PlayerHandle(0)].into(), // should not matter since the spectator is never sending
             self.max_prediction,
             self.disconnect_timeout,
             self.disconnect_notify_start,
@@ -329,7 +309,7 @@ impl<T: Config> SessionBuilder<T> {
             DesyncDetection::Off,
         );
         SpectatorSession::new(
-            self.num_players,
+            playing_player_handles,
             Box::new(socket),
             host,
             self.max_frames_behind,
@@ -350,7 +330,11 @@ impl<T: Config> SessionBuilder<T> {
             });
         }
         Ok(SyncTestSession::new(
-            self.num_players,
+            self.player_reg
+                .local_player_handles()
+                .iter()
+                .copied()
+                .collect(),
             self.max_prediction,
             self.check_dist,
             self.input_delay,
@@ -359,15 +343,16 @@ impl<T: Config> SessionBuilder<T> {
 
     fn create_endpoint(
         &self,
-        handles: Vec<PlayerHandle>,
+        address_players: BTreeSet<PlayerHandle>,
         peer_addr: T::Address,
-        local_players: usize,
+        playing_player_handles: BTreeSet<PlayerHandle>,
+        local_player_handles: BTreeSet<PlayerHandle>,
     ) -> UdpProtocol<T> {
         UdpProtocol::new(
-            handles,
+            address_players,
             peer_addr,
-            self.num_players,
-            local_players,
+            playing_player_handles,
+            local_player_handles,
             self.max_prediction,
             self.disconnect_timeout,
             self.disconnect_notify_start,

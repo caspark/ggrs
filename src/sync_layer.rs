@@ -1,4 +1,5 @@
 use parking_lot::{MappedMutexGuard, Mutex};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -169,31 +170,27 @@ pub(crate) struct SyncLayer<T>
 where
     T: Config,
 {
-    num_players: usize,
     max_prediction: usize,
     saved_states: SavedStates<T::State>,
     last_confirmed_frame: Frame,
     last_saved_frame: Frame,
     current_frame: Frame,
-    input_queues: Vec<InputQueue<T>>,
+    input_queues: HashMap<PlayerHandle, InputQueue<T>>,
 }
 
 impl<T: Config> SyncLayer<T> {
     /// Creates a new `SyncLayer` instance with given values.
-    pub(crate) fn new(num_players: usize, max_prediction: usize) -> Self {
-        // initialize input_queues
-        let mut input_queues = Vec::new();
-        for _ in 0..num_players {
-            input_queues.push(InputQueue::new());
-        }
+    pub(crate) fn new(players: HashSet<PlayerHandle>, max_prediction: usize) -> Self {
         Self {
-            num_players,
             max_prediction,
             last_confirmed_frame: NULL_FRAME,
             last_saved_frame: NULL_FRAME,
             current_frame: 0,
             saved_states: SavedStates::new(max_prediction),
-            input_queues,
+            input_queues: players
+                .into_iter()
+                .map(|handle| (handle, InputQueue::new()))
+                .collect(),
         }
     }
 
@@ -215,13 +212,15 @@ impl<T: Config> SyncLayer<T> {
     }
 
     pub(crate) fn set_frame_delay(&mut self, player_handle: PlayerHandle, delay: usize) {
-        assert!(player_handle < self.num_players as PlayerHandle);
-        self.input_queues[player_handle].set_frame_delay(delay);
+        self.input_queues
+            .get_mut(&player_handle)
+            .expect("Player handle must be known to set frame delay")
+            .set_frame_delay(delay);
     }
 
     pub(crate) fn reset_prediction(&mut self) {
-        for i in 0..self.num_players {
-            self.input_queues[i].reset_prediction();
+        for input_queue in self.input_queues.values_mut() {
+            input_queue.reset_prediction();
         }
     }
 
@@ -263,7 +262,10 @@ impl<T: Config> SyncLayer<T> {
     ) -> Frame {
         // The input provided should match the current frame, we account for input delay later
         assert_eq!(input.frame, self.current_frame);
-        self.input_queues[player_handle].add_input(input)
+        self.input_queues
+            .get_mut(&player_handle)
+            .expect("Player handle must be known to add local input")
+            .add_input(input)
     }
 
     /// Adds remote input to the corresponding input queue.
@@ -273,20 +275,32 @@ impl<T: Config> SyncLayer<T> {
         player_handle: PlayerHandle,
         input: PlayerInput<T::Input>,
     ) {
-        self.input_queues[player_handle].add_input(input);
+        self.input_queues
+            .get_mut(&player_handle)
+            .expect("Player handle must be known to add remote input")
+            .add_input(input);
     }
 
     /// Returns inputs for all players for the current frame of the sync layer. If there are none for a specific player, return predictions.
     pub(crate) fn synchronized_inputs(
         &mut self,
-        connect_status: &[ConnectionStatus],
-    ) -> Vec<(T::Input, InputStatus)> {
-        let mut inputs = Vec::new();
-        for (i, con_stat) in connect_status.iter().enumerate() {
+        connect_status: &HashMap<PlayerHandle, ConnectionStatus>,
+    ) -> HashMap<PlayerHandle, (T::Input, InputStatus)> {
+        let mut inputs = HashMap::new();
+        for (player_handle, con_stat) in connect_status.iter() {
             if con_stat.disconnected && con_stat.last_frame < self.current_frame {
-                inputs.push((T::Input::default(), InputStatus::Disconnected));
+                inputs.insert(
+                    *player_handle,
+                    (T::Input::default(), InputStatus::Disconnected),
+                );
             } else {
-                inputs.push(self.input_queues[i].input(self.current_frame));
+                inputs.insert(
+                    *player_handle,
+                    self.input_queues
+                        .get_mut(player_handle)
+                        .expect("can only get synchronized input for known player handles")
+                        .input(self.current_frame),
+                );
             }
         }
         inputs
@@ -296,14 +310,17 @@ impl<T: Config> SyncLayer<T> {
     pub(crate) fn confirmed_inputs(
         &self,
         frame: Frame,
-        connect_status: &[ConnectionStatus],
-    ) -> Vec<PlayerInput<T::Input>> {
-        let mut inputs = Vec::new();
-        for (i, con_stat) in connect_status.iter().enumerate() {
+        connect_status: &HashMap<PlayerHandle, ConnectionStatus>,
+    ) -> BTreeMap<PlayerHandle, PlayerInput<T::Input>> {
+        let mut inputs = BTreeMap::new();
+        for (player_handle, con_stat) in connect_status.iter() {
             if con_stat.disconnected && con_stat.last_frame < frame {
-                inputs.push(PlayerInput::blank_input(NULL_FRAME));
+                inputs.insert(*player_handle, PlayerInput::blank_input(NULL_FRAME));
             } else {
-                inputs.push(self.input_queues[i].confirmed_input(frame));
+                inputs.insert(
+                    *player_handle,
+                    self.input_queues[&player_handle].confirmed_input(frame),
+                );
             }
         }
         inputs
@@ -313,11 +330,8 @@ impl<T: Config> SyncLayer<T> {
     pub(crate) fn set_last_confirmed_frame(&mut self, mut frame: Frame, sparse_saving: bool) {
         // don't set the last confirmed frame after the first incorrect frame before a rollback has happened
         let mut first_incorrect: Frame = NULL_FRAME;
-        for handle in 0..self.num_players {
-            first_incorrect = std::cmp::max(
-                first_incorrect,
-                self.input_queues[handle].first_incorrect_frame(),
-            );
+        for input_queue in self.input_queues.values() {
+            first_incorrect = std::cmp::max(first_incorrect, input_queue.first_incorrect_frame());
         }
 
         // if sparse saving option is turned on, don't set the last confirmed frame after the last saved frame
@@ -333,16 +347,16 @@ impl<T: Config> SyncLayer<T> {
 
         self.last_confirmed_frame = frame;
         if self.last_confirmed_frame > 0 {
-            for i in 0..self.num_players {
-                self.input_queues[i].discard_confirmed_frames(frame - 1);
+            for input_queue in self.input_queues.values_mut() {
+                input_queue.discard_confirmed_frames(frame - 1);
             }
         }
     }
 
     /// Finds the earliest incorrect frame detected by the individual input queues
     pub(crate) fn check_simulation_consistency(&self, mut first_incorrect: Frame) -> Frame {
-        for handle in 0..self.num_players {
-            let incorrect = self.input_queues[handle].first_incorrect_frame();
+        for input_queue in self.input_queues.values() {
+            let incorrect = input_queue.first_incorrect_frame();
             if incorrect != NULL_FRAME
                 && (first_incorrect == NULL_FRAME || incorrect < first_incorrect)
             {
@@ -403,29 +417,32 @@ mod sync_layer_tests {
 
     #[test]
     fn test_different_delays() {
-        let mut sync_layer = SyncLayer::<TestConfig>::new(2, 8);
+        let player_a = PlayerHandle(0);
+        let player_b = PlayerHandle(1);
+
+        let mut sync_layer = SyncLayer::<TestConfig>::new([player_a, player_b].into(), 8);
         let p1_delay = 2;
         let p2_delay = 0;
-        sync_layer.set_frame_delay(0, p1_delay);
-        sync_layer.set_frame_delay(1, p2_delay);
+        sync_layer.set_frame_delay(player_a, p1_delay);
+        sync_layer.set_frame_delay(player_b, p2_delay);
 
-        let mut dummy_connect_status = Vec::new();
-        dummy_connect_status.push(ConnectionStatus::default());
-        dummy_connect_status.push(ConnectionStatus::default());
+        let mut dummy_connect_status = HashMap::new();
+        dummy_connect_status.insert(player_a, ConnectionStatus::default());
+        dummy_connect_status.insert(player_b, ConnectionStatus::default());
 
         for i in 0..20 {
             let game_input = PlayerInput::new(i, TestInput { inp: i as u8 });
             // adding input as remote to avoid prediction threshold detection
-            sync_layer.add_remote_input(0, game_input);
-            sync_layer.add_remote_input(1, game_input);
+            sync_layer.add_remote_input(player_a, game_input);
+            sync_layer.add_remote_input(player_b, game_input);
             // update the dummy connect status
-            dummy_connect_status[0].last_frame = i;
-            dummy_connect_status[1].last_frame = i;
+            dummy_connect_status.get_mut(&player_a).unwrap().last_frame = i;
+            dummy_connect_status.get_mut(&player_b).unwrap().last_frame = i;
 
             if i >= 3 {
                 let sync_inputs = sync_layer.synchronized_inputs(&dummy_connect_status);
-                let player0_inputs = sync_inputs[0].0.inp;
-                let player1_inputs = sync_inputs[1].0.inp;
+                let player0_inputs = sync_inputs[&player_a].0.inp;
+                let player1_inputs = sync_inputs[&player_b].0.inp;
                 assert_eq!(player0_inputs, i as u8 - p1_delay as u8);
                 assert_eq!(player1_inputs, i as u8 - p2_delay as u8);
             }

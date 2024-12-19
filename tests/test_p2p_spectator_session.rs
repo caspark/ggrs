@@ -1,6 +1,6 @@
 mod stubs;
 
-use ggrs::{GgrsError, PlayerType, SessionBuilder, UdpNonBlockingSocket};
+use ggrs::{GgrsError, PlayerHandle, PlayerType, SessionBuilder, UdpNonBlockingSocket};
 use serial_test::serial;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use stubs::{StubConfig, StubInput};
@@ -13,9 +13,8 @@ fn test_can_follow_host() -> Result<(), GgrsError> {
 
     let socket1 = UdpNonBlockingSocket::bind_to_port(7777).unwrap();
     let mut host_sess = SessionBuilder::<StubConfig>::new()
-        .with_num_players(1)
-        .add_player(PlayerType::Local, 0)?
-        .add_player(PlayerType::Spectator(spec_addr), 2)?
+        .add_player(PlayerType::Local, PlayerHandle(0))?
+        .add_player(PlayerType::Spectator(spec_addr), PlayerHandle(2))?
         .start_p2p_session(socket1)?;
 
     let socket2 = UdpNonBlockingSocket::bind_to_port(8888).unwrap();
@@ -31,7 +30,9 @@ fn test_can_follow_host() -> Result<(), GgrsError> {
         host_sess.poll_remote_clients();
         spec_sess.poll_remote_clients();
 
-        host_sess.add_local_input(0, StubInput { inp: i }).unwrap();
+        host_sess
+            .add_local_input(PlayerHandle(0), StubInput { inp: i })
+            .unwrap();
         let requests1 = host_sess.advance_frame().unwrap();
         host_game.handle_requests(requests1);
 

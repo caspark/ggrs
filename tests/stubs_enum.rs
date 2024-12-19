@@ -1,8 +1,11 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 
-use ggrs::{Config, Frame, GameStateCell, GgrsRequest, InputStatus, PredictRepeatLast};
+use ggrs::{
+    Config, Frame, GameStateCell, GgrsRequest, InputStatus, PlayerHandle, PredictRepeatLast,
+};
 use serde::{Deserialize, Serialize};
 
 fn calculate_hash<T: Hash>(t: &T) -> u64 {
@@ -62,7 +65,7 @@ impl GameStubEnum {
         self.gs = cell.load().unwrap();
     }
 
-    fn advance_frame(&mut self, inputs: Vec<(EnumInput, InputStatus)>) {
+    fn advance_frame(&mut self, inputs: HashMap<PlayerHandle, (EnumInput, InputStatus)>) {
         self.gs.advance_frame(inputs);
     }
 }
@@ -74,9 +77,9 @@ pub struct StateStubEnum {
 }
 
 impl StateStubEnum {
-    fn advance_frame(&mut self, inputs: Vec<(EnumInput, InputStatus)>) {
-        let p0_inputs = inputs[0];
-        let p1_inputs = inputs[1];
+    fn advance_frame(&mut self, inputs: HashMap<PlayerHandle, (EnumInput, InputStatus)>) {
+        let p0_inputs = inputs[&PlayerHandle(0)];
+        let p1_inputs = inputs[&PlayerHandle(1)];
 
         if p0_inputs == p1_inputs {
             self.state += 2;

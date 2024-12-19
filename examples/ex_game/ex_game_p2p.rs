@@ -1,10 +1,10 @@
 mod ex_game;
 
 use ex_game::{GGRSConfig, Game};
-use ggrs::{PlayerType, SessionBuilder, UdpNonBlockingSocket};
+use ggrs::{PlayerHandle, PlayerType, SessionBuilder, UdpNonBlockingSocket};
 use instant::{Duration, Instant};
 use macroquad::prelude::*;
-use std::net::SocketAddr;
+use std::{collections::BTreeSet, net::SocketAddr};
 use structopt::StructOpt;
 
 const FPS: f64 = 60.0;
@@ -50,7 +50,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // create a GGRS session
     let mut sess_build = SessionBuilder::<GGRSConfig>::new()
-        .with_num_players(num_players)
         // (optional) exchange and validate state checksums
         .with_desync_detection_mode(ggrs::DesyncDetection::On { interval: 100 })
         // (optional) set expected update frequency
@@ -70,17 +69,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, player_addr) in opt.players.iter().enumerate() {
         // local player
         if player_addr == "localhost" {
-            sess_build = sess_build.add_player(PlayerType::Local, i)?;
+            sess_build = sess_build.add_player(PlayerType::Local, i.try_into()?)?;
         } else {
             // remote players
             let remote_addr: SocketAddr = player_addr.parse()?;
-            sess_build = sess_build.add_player(PlayerType::Remote(remote_addr), i)?;
+            sess_build = sess_build.add_player(PlayerType::Remote(remote_addr), i.try_into()?)?;
         }
     }
 
     // optionally, add spectators
     for (i, spec_addr) in opt.spectators.iter().enumerate() {
-        sess_build = sess_build.add_player(PlayerType::Spectator(*spec_addr), num_players + i)?;
+        sess_build = sess_build.add_player(
+            PlayerType::Spectator(*spec_addr),
+            (num_players + i).try_into()?,
+        )?;
     }
 
     // start the GGRS session
@@ -91,7 +93,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("session created");
 
     // Create a new box game
-    let mut game = Game::new(num_players);
+    let all_players: BTreeSet<PlayerHandle> = {
+        let mut all_players = BTreeSet::new();
+        for player_number in 0..num_players {
+            all_players.insert(player_number.try_into()?);
+        }
+        all_players
+    };
+    let mut game = Game::new(all_players);
     game.register_local_handles(sess.local_player_handles());
 
     // time variables for tick rate

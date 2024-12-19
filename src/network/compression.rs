@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::PlayerHandle;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct EncodedInputSequence {
     /// Size of each input in the sequence relative to the reference input for the first input, and

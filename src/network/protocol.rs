@@ -7,11 +7,11 @@ use crate::network::messages::{
 };
 use crate::time_sync::TimeSync;
 use crate::{Config, DesyncDetection, Frame, NonBlockingSocket, PlayerHandle, NULL_FRAME};
-use tracing::trace;
+use tracing::{trace, warn};
 
 use instant::{Duration, Instant};
 use std::collections::vec_deque::Drain;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::convert::TryFrom;
 use std::ops::Add;
 
@@ -50,46 +50,52 @@ struct InputBytes {
 }
 
 impl InputBytes {
-    fn zeroed<T: Config>(num_players: usize) -> Self {
-        let size = core::mem::size_of::<T::Input>() * num_players;
+    fn zeroed<T: Config>(num_handles: usize) -> Self {
+        let size = core::mem::size_of::<T::Input>() * num_handles;
         Self {
             frame: NULL_FRAME,
             bytes: vec![0; size],
         }
     }
 
-    fn from_inputs<T: Config>(
-        num_players: usize,
-        inputs: &HashMap<PlayerHandle, PlayerInput<T::Input>>,
-    ) -> Self {
-        let mut bytes = Vec::new();
+    fn from_inputs<T: Config>(inputs: &BTreeMap<PlayerHandle, PlayerInput<T::Input>>) -> Self {
         let mut frame = NULL_FRAME;
-        // in ascending order
-        for handle in 0..num_players {
-            if let Some(input) = inputs.get(&handle) {
-                assert!(frame == NULL_FRAME || input.frame == NULL_FRAME || frame == input.frame);
-                if input.frame != NULL_FRAME {
-                    frame = input.frame;
-                }
-
-                bincode::serialize_into(&mut bytes, &input.input)
-                    .expect("input serialization failed");
+        let mut handles = Vec::new();
+        let mut bytes = Vec::new();
+        // handles (& hence inputs) are guaranteed to be in handle-order due to being in a BTreeMap,
+        // which makes it possible to restore the mapping from handles to input index
+        for (handle, input) in inputs.iter() {
+            assert!(frame == NULL_FRAME || input.frame == NULL_FRAME || frame == input.frame);
+            if input.frame != NULL_FRAME {
+                frame = input.frame;
             }
+
+            handles.push(*handle);
+
+            bincode::serialize_into(&mut bytes, &input.input).expect("input serialization failed");
         }
         Self { frame, bytes }
     }
 
-    fn to_player_inputs<T: Config>(&self, num_players: usize) -> Vec<PlayerInput<T::Input>> {
-        let mut player_inputs = Vec::new();
-        assert!(self.bytes.len() % num_players == 0);
-        let size = self.bytes.len() / num_players;
-        for p in 0..num_players {
-            let start = p * size;
-            let end = start + size;
-            let player_byte_slice = &self.bytes[start..end];
+    fn to_player_inputs<T: Config>(
+        &self,
+        handles: &BTreeSet<PlayerHandle>,
+    ) -> HashMap<PlayerHandle, PlayerInput<T::Input>> {
+        let mut player_inputs = HashMap::new();
+        assert!(
+            self.bytes.len() % handles.len() == 0,
+            "input bytes length must be a multiple of player handle count"
+        );
+        let per_player_size = self.bytes.len() / handles.len();
+        // since handles are in handle-order due to being in a BTreeSet, we can just iterate over
+        // the handles in order and they should match the order that inputs were serialized into
+        // bytes - as long as the known handles are the same in each case.
+        for (handle, player_byte_slice) in
+            handles.iter().zip(self.bytes.chunks_exact(per_player_size))
+        {
             let input: T::Input =
                 bincode::deserialize(player_byte_slice).expect("input deserialization failed");
-            player_inputs.push(PlayerInput::new(self.frame, input));
+            player_inputs.insert(*handle, PlayerInput::new(self.frame, input));
         }
         player_inputs
     }
@@ -124,8 +130,7 @@ pub(crate) struct UdpProtocol<T>
 where
     T: Config,
 {
-    num_players: usize,
-    handles: Vec<PlayerHandle>,
+    handles: BTreeSet<PlayerHandle>,
     send_queue: VecDeque<Message>,
     event_queue: VecDeque<Event<T>>,
 
@@ -146,13 +151,13 @@ where
     // the other client
     peer_addr: T::Address,
     // remote_magic: u16,
-    peer_connect_status: Vec<ConnectionStatus>,
+    peer_connect_status: HashMap<PlayerHandle, ConnectionStatus>,
 
     // input compression
-    pending_output: VecDeque<InputBytes>,
-    last_acked_input: InputBytes,
+    pending_output: VecDeque<InputBytes>, // input we're going to send
+    last_acked_input: InputBytes,         // we delta-encode inputs we send relative to this
     max_prediction: usize,
-    recv_inputs: HashMap<Frame, InputBytes>,
+    recv_inputs: HashMap<Frame, InputBytes>, // we delta-decode inputs received relative to these old received inputs
 
     // time sync
     time_sync_layer: TimeSync,
@@ -180,10 +185,16 @@ impl<T: Config> PartialEq for UdpProtocol<T> {
 
 impl<T: Config> UdpProtocol<T> {
     pub(crate) fn new(
-        mut handles: Vec<PlayerHandle>,
+        // handles == the handles that are at the address that corresponds to this endpoint
+        handles: BTreeSet<PlayerHandle>,
         peer_addr: T::Address,
-        num_players: usize,
-        local_players: usize,
+        // playing_players == the player handles that exist in the game as actual players
+        // (not spectators)
+        playing_player_handles: BTreeSet<PlayerHandle>,
+        // local player handles == the player handles that we send inputs for (to this remote client)
+        // e.g. for a spectator, we send input for all players
+        // e.g. for p2p session remote players, we send input for only local players
+        local_player_handles: BTreeSet<PlayerHandle>,
         max_prediction: usize,
         disconnect_timeout: Duration,
         disconnect_notify_start: Duration,
@@ -195,21 +206,20 @@ impl<T: Config> UdpProtocol<T> {
             magic = rand::random::<u16>();
         }
 
-        handles.sort_unstable();
-        let recv_player_num = handles.len();
-
         // peer connection status
-        let mut peer_connect_status = Vec::new();
-        for _ in 0..num_players {
-            peer_connect_status.push(ConnectionStatus::default());
-        }
+        let peer_connect_status = playing_player_handles
+            .into_iter()
+            .map(|h| (h, ConnectionStatus::default()))
+            .collect();
 
         // received input history
         let mut recv_inputs = HashMap::new();
-        recv_inputs.insert(NULL_FRAME, InputBytes::zeroed::<T>(recv_player_num));
+
+        // zeroed input is put into the received inputs so that it can be read to be the reference
+        // when we're decoding the very first received input
+        recv_inputs.insert(NULL_FRAME, InputBytes::zeroed::<T>(handles.len()));
 
         Self {
-            num_players,
             handles,
             send_queue: VecDeque::new(),
             event_queue: VecDeque::new(),
@@ -234,7 +244,7 @@ impl<T: Config> UdpProtocol<T> {
 
             // input compression
             pending_output: VecDeque::with_capacity(PENDING_OUTPUT_SIZE),
-            last_acked_input: InputBytes::zeroed::<T>(local_players),
+            last_acked_input: InputBytes::zeroed::<T>(local_player_handles.len()),
             max_prediction,
             recv_inputs,
 
@@ -292,7 +302,7 @@ impl<T: Config> UdpProtocol<T> {
         })
     }
 
-    pub(crate) fn handles(&self) -> &Vec<PlayerHandle> {
+    pub(crate) fn handles(&self) -> &BTreeSet<PlayerHandle> {
         &self.handles
     }
 
@@ -305,7 +315,12 @@ impl<T: Config> UdpProtocol<T> {
     }
 
     pub(crate) fn peer_connect_status(&self, handle: PlayerHandle) -> ConnectionStatus {
-        self.peer_connect_status[handle]
+        tracing::info!(
+            "getting peer connect status for handle {:?}; protocol peer connect status is {:?}",
+            handle,
+            self.peer_connect_status
+        );
+        self.peer_connect_status[&handle]
     }
 
     pub(crate) fn disconnect(&mut self) {
@@ -326,7 +341,10 @@ impl<T: Config> UdpProtocol<T> {
         self.peer_addr.clone()
     }
 
-    pub(crate) fn poll(&mut self, connect_status: &[ConnectionStatus]) -> Drain<Event<T>> {
+    pub(crate) fn poll(
+        &mut self,
+        connect_status: &HashMap<PlayerHandle, ConnectionStatus>,
+    ) -> Drain<Event<T>> {
         let now = Instant::now();
         match self.state {
             ProtocolState::Running => {
@@ -420,14 +438,14 @@ impl<T: Config> UdpProtocol<T> {
 
     pub(crate) fn send_input(
         &mut self,
-        inputs: &HashMap<PlayerHandle, PlayerInput<T::Input>>,
-        connect_status: &[ConnectionStatus],
+        inputs: &BTreeMap<PlayerHandle, PlayerInput<T::Input>>,
+        connect_status: &HashMap<PlayerHandle, ConnectionStatus>,
     ) {
         if self.state != ProtocolState::Running {
             return;
         }
 
-        let endpoint_data = InputBytes::from_inputs::<T>(self.num_players, inputs);
+        let endpoint_data = InputBytes::from_inputs::<T>(inputs);
 
         // register the input and advantages in the time sync layer
         self.time_sync_layer.advance_frame(
@@ -447,18 +465,15 @@ impl<T: Config> UdpProtocol<T> {
         self.send_pending_output(connect_status);
     }
 
-    fn send_pending_output(&mut self, connect_status: &[ConnectionStatus]) {
-        let mut body = Input::default();
-
-        if let Some(input) = self.pending_output.front() {
+    fn send_pending_output(&mut self, connect_status: &HashMap<PlayerHandle, ConnectionStatus>) {
+        if let Some(oldest_input_to_send) = self.pending_output.front() {
             assert!(
                 self.last_acked_input.frame == NULL_FRAME
-                    || self.last_acked_input.frame + 1 == input.frame
+                    || self.last_acked_input.frame + 1 == oldest_input_to_send.frame
             );
-            body.start_frame = input.frame;
 
             // encode all pending inputs to a byte buffer
-            body.bytes = encode(
+            let bytes = encode(
                 &self.last_acked_input.bytes,
                 self.pending_output
                     .iter()
@@ -475,14 +490,16 @@ impl<T: Config> UdpProtocol<T> {
                     sum
                 },
                 self.pending_output.len(),
-                body.bytes.len()
+                bytes.len()
             );
 
-            body.ack_frame = self.last_recv_frame();
-            body.disconnect_requested = self.state == ProtocolState::Disconnected;
-            connect_status.clone_into(&mut body.peer_connect_status);
-
-            self.queue_message(MessageBody::Input(body));
+            self.queue_message(MessageBody::Input(Input {
+                peer_connect_status: connect_status.clone(),
+                disconnect_requested: self.state == ProtocolState::Disconnected,
+                start_frame: oldest_input_to_send.frame,
+                ack_frame: self.last_recv_frame(),
+                bytes,
+            }));
         }
     }
 
@@ -574,12 +591,21 @@ impl<T: Config> UdpProtocol<T> {
             }
         } else {
             // update the peer connection status
-            for i in 0..self.peer_connect_status.len() {
-                self.peer_connect_status[i].disconnected = body.peer_connect_status[i].disconnected
-                    || self.peer_connect_status[i].disconnected;
-                self.peer_connect_status[i].last_frame = std::cmp::max(
-                    self.peer_connect_status[i].last_frame,
-                    body.peer_connect_status[i].last_frame,
+            for (handle, peer_connect_status) in self.peer_connect_status.iter_mut() {
+                let Some(body_peer_connect_status) = body.peer_connect_status.get(handle) else {
+                    // We have a handle that the peer does not know about; normally we would expect
+                    // the peer to send us the connection status for all handles since they should
+                    // have the same handles as us. So, this peer is misbehaving but we don't want
+                    // to allow remote clients to cause a crash, so we just log a warning.
+                    warn!("Remote peer did not include connection status for handle {handle:?}");
+                    continue;
+                };
+
+                peer_connect_status.disconnected =
+                    body_peer_connect_status.disconnected || peer_connect_status.disconnected;
+                peer_connect_status.last_frame = std::cmp::max(
+                    peer_connect_status.last_frame,
+                    body_peer_connect_status.last_frame,
                 );
             }
         }
@@ -619,14 +645,11 @@ impl<T: Config> UdpProtocol<T> {
                     bytes: inp,
                 };
                 // send the input to the session
-                let player_inputs = input_data.to_player_inputs::<T>(self.handles.len());
+                let player_inputs = input_data.to_player_inputs::<T>(&self.handles);
                 self.recv_inputs.insert(input_data.frame, input_data);
 
-                for (i, player_input) in player_inputs.into_iter().enumerate() {
-                    self.event_queue.push_back(Event::Input {
-                        input: player_input,
-                        player: self.handles[i],
-                    });
+                for (player, input) in player_inputs.into_iter() {
+                    self.event_queue.push_back(Event::Input { input, player });
                 }
             }
 

@@ -1,7 +1,9 @@
 mod ex_game;
 
+use std::collections::BTreeSet;
+
 use ex_game::Game;
-use ggrs::SessionBuilder;
+use ggrs::{PlayerHandle, SessionBuilder};
 use instant::{Duration, Instant};
 use macroquad::prelude::*;
 use structopt::StructOpt;
@@ -45,14 +47,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // create a GGRS session
     let mut sess = SessionBuilder::new()
-        .with_num_players(opt.num_players)
         .with_check_distance(opt.check_distance)
         .with_input_delay(2)
         .start_synctest_session()?;
 
     // Create a new box game
-    let mut game = Game::new(opt.num_players);
-    game.register_local_handles((0..opt.num_players).collect());
+    let all_players: BTreeSet<PlayerHandle> = {
+        let mut all_players = BTreeSet::new();
+        for player_number in 0..opt.num_players {
+            all_players.insert(player_number.try_into()?);
+        }
+        all_players
+    };
+    let mut game = Game::new(all_players.clone());
+    game.register_local_handles(all_players.clone());
 
     // time variables for tick rate
     let mut last_update = Instant::now();
@@ -71,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             accumulator = accumulator.saturating_sub(Duration::from_secs_f64(fps_delta));
 
             // gather inputs
-            for handle in 0..opt.num_players {
+            for handle in sess.local_player_handles() {
                 sess.add_local_input(handle, game.local_input(handle))?;
             }
 

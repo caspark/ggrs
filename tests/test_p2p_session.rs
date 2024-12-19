@@ -1,7 +1,8 @@
 mod stubs;
 
 use ggrs::{
-    DesyncDetection, GgrsError, GgrsEvent, PlayerType, SessionBuilder, UdpNonBlockingSocket,
+    DesyncDetection, GgrsError, GgrsEvent, PlayerHandle, PlayerType, SessionBuilder,
+    UdpNonBlockingSocket,
 };
 use serial_test::serial;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -17,12 +18,11 @@ fn test_add_more_players() -> Result<(), GgrsError> {
     let spec_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8090);
 
     let _sess = SessionBuilder::<StubConfig>::new()
-        .with_num_players(4)
-        .add_player(PlayerType::Local, 0)?
-        .add_player(PlayerType::Remote(remote_addr1), 1)?
-        .add_player(PlayerType::Remote(remote_addr2), 2)?
-        .add_player(PlayerType::Remote(remote_addr3), 3)?
-        .add_player(PlayerType::Spectator(spec_addr), 4)?
+        .add_player(PlayerType::Local, PlayerHandle(0))?
+        .add_player(PlayerType::Remote(remote_addr1), PlayerHandle(1))?
+        .add_player(PlayerType::Remote(remote_addr2), PlayerHandle(2))?
+        .add_player(PlayerType::Remote(remote_addr3), PlayerHandle(3))?
+        .add_player(PlayerType::Spectator(spec_addr), PlayerHandle(4))?
         .start_p2p_session(socket)?;
     Ok(())
 }
@@ -35,9 +35,9 @@ fn test_start_session() -> Result<(), GgrsError> {
     let spec_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8090);
 
     let _sess = SessionBuilder::<StubConfig>::new()
-        .add_player(PlayerType::Local, 0)?
-        .add_player(PlayerType::Remote(remote_addr), 1)?
-        .add_player(PlayerType::Spectator(spec_addr), 2)?
+        .add_player(PlayerType::Local, PlayerHandle(0))?
+        .add_player(PlayerType::Remote(remote_addr), PlayerHandle(1))?
+        .add_player(PlayerType::Spectator(spec_addr), PlayerHandle(2))?
         .start_p2p_session(socket)?;
     Ok(())
 }
@@ -50,16 +50,16 @@ fn test_disconnect_player() -> Result<(), GgrsError> {
     let spec_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8090);
 
     let mut sess = SessionBuilder::<StubConfig>::new()
-        .add_player(PlayerType::Local, 0)?
-        .add_player(PlayerType::Remote(remote_addr), 1)?
-        .add_player(PlayerType::Spectator(spec_addr), 2)?
+        .add_player(PlayerType::Local, PlayerHandle(0))?
+        .add_player(PlayerType::Remote(remote_addr), PlayerHandle(1))?
+        .add_player(PlayerType::Spectator(spec_addr), PlayerHandle(2))?
         .start_p2p_session(socket)?;
 
-    assert!(sess.disconnect_player(5).is_err()); // invalid handle
-    assert!(sess.disconnect_player(0).is_err()); // for now, local players cannot be disconnected
-    assert!(sess.disconnect_player(1).is_ok());
-    assert!(sess.disconnect_player(1).is_err()); // already disconnected
-    assert!(sess.disconnect_player(2).is_ok());
+    assert!(sess.disconnect_player(PlayerHandle(5)).is_err()); // invalid handle
+    assert!(sess.disconnect_player(PlayerHandle(0)).is_err()); // for now, local players cannot be disconnected
+    assert!(sess.disconnect_player(PlayerHandle(1)).is_ok());
+    assert!(sess.disconnect_player(PlayerHandle(1)).is_err()); // already disconnected
+    assert!(sess.disconnect_player(PlayerHandle(2)).is_ok());
 
     Ok(())
 }
@@ -72,14 +72,14 @@ fn test_advance_frame_p2p_sessions() -> Result<(), GgrsError> {
 
     let socket1 = UdpNonBlockingSocket::bind_to_port(7777).unwrap();
     let mut sess1 = SessionBuilder::<StubConfig>::new()
-        .add_player(PlayerType::Local, 0)?
-        .add_player(PlayerType::Remote(addr2), 1)?
+        .add_player(PlayerType::Local, PlayerHandle(0))?
+        .add_player(PlayerType::Remote(addr2), PlayerHandle(1))?
         .start_p2p_session(socket1)?;
 
     let socket2 = UdpNonBlockingSocket::bind_to_port(8888).unwrap();
     let mut sess2 = SessionBuilder::<StubConfig>::new()
-        .add_player(PlayerType::Remote(addr1), 0)?
-        .add_player(PlayerType::Local, 1)?
+        .add_player(PlayerType::Remote(addr1), PlayerHandle(0))?
+        .add_player(PlayerType::Local, PlayerHandle(1))?
         .start_p2p_session(socket2)?;
 
     for _ in 0..50 {
@@ -94,10 +94,14 @@ fn test_advance_frame_p2p_sessions() -> Result<(), GgrsError> {
         sess1.poll_remote_clients();
         sess2.poll_remote_clients();
 
-        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
+        sess1
+            .add_local_input(PlayerHandle(0), StubInput { inp: i })
+            .unwrap();
         let requests1 = sess1.advance_frame().unwrap();
         stub1.handle_requests(requests1);
-        sess2.add_local_input(1, StubInput { inp: i }).unwrap();
+        sess2
+            .add_local_input(PlayerHandle(1), StubInput { inp: i })
+            .unwrap();
         let requests2 = sess2.advance_frame().unwrap();
         stub2.handle_requests(requests2);
 
@@ -118,15 +122,15 @@ fn test_desyncs_detected() -> Result<(), GgrsError> {
 
     let socket1 = UdpNonBlockingSocket::bind_to_port(7777).unwrap();
     let mut sess1 = SessionBuilder::<StubConfig>::new()
-        .add_player(PlayerType::Local, 0)?
-        .add_player(PlayerType::Remote(addr2), 1)?
+        .add_player(PlayerType::Local, PlayerHandle(0))?
+        .add_player(PlayerType::Remote(addr2), PlayerHandle(1))?
         .with_desync_detection_mode(desync_mode)
         .start_p2p_session(socket1)?;
 
     let socket2 = UdpNonBlockingSocket::bind_to_port(8888).unwrap();
     let mut sess2 = SessionBuilder::<StubConfig>::new()
-        .add_player(PlayerType::Remote(addr1), 0)?
-        .add_player(PlayerType::Local, 1)?
+        .add_player(PlayerType::Remote(addr1), PlayerHandle(0))?
+        .add_player(PlayerType::Local, PlayerHandle(1))?
         .with_desync_detection_mode(desync_mode)
         .start_p2p_session(socket2)?;
 
@@ -140,8 +144,12 @@ fn test_desyncs_detected() -> Result<(), GgrsError> {
         sess1.poll_remote_clients();
         sess2.poll_remote_clients();
 
-        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
-        sess2.add_local_input(1, StubInput { inp: i }).unwrap();
+        sess1
+            .add_local_input(PlayerHandle(0), StubInput { inp: i })
+            .unwrap();
+        sess2
+            .add_local_input(PlayerHandle(1), StubInput { inp: i })
+            .unwrap();
 
         let requests1 = sess1.advance_frame().unwrap();
         let requests2 = sess2.advance_frame().unwrap();
@@ -163,8 +171,12 @@ fn test_desyncs_detected() -> Result<(), GgrsError> {
         stub1.gs.state = 1234;
 
         // keep input steady (to avoid loads, which would restore valid state)
-        sess1.add_local_input(0, StubInput { inp: 0 }).unwrap();
-        sess2.add_local_input(1, StubInput { inp: 1 }).unwrap();
+        sess1
+            .add_local_input(PlayerHandle(0), StubInput { inp: 0 })
+            .unwrap();
+        sess2
+            .add_local_input(PlayerHandle(1), StubInput { inp: 1 })
+            .unwrap();
 
         let requests1 = sess1.advance_frame().unwrap();
         let requests2 = sess2.advance_frame().unwrap();
@@ -221,16 +233,16 @@ fn test_desyncs_and_input_delay_no_panic() -> Result<(), GgrsError> {
 
     let socket1 = UdpNonBlockingSocket::bind_to_port(7777).unwrap();
     let mut sess1 = SessionBuilder::<StubConfig>::new()
-        .add_player(PlayerType::Local, 0)?
-        .add_player(PlayerType::Remote(addr2), 1)?
+        .add_player(PlayerType::Local, PlayerHandle(0))?
+        .add_player(PlayerType::Remote(addr2), PlayerHandle(1))?
         .with_input_delay(5)
         .with_desync_detection_mode(desync_mode)
         .start_p2p_session(socket1)?;
 
     let socket2 = UdpNonBlockingSocket::bind_to_port(8888).unwrap();
     let mut sess2 = SessionBuilder::<StubConfig>::new()
-        .add_player(PlayerType::Remote(addr1), 0)?
-        .add_player(PlayerType::Local, 1)?
+        .add_player(PlayerType::Remote(addr1), PlayerHandle(0))?
+        .add_player(PlayerType::Local, PlayerHandle(1))?
         .with_input_delay(5)
         .with_desync_detection_mode(desync_mode)
         .start_p2p_session(socket2)?;
@@ -243,8 +255,12 @@ fn test_desyncs_and_input_delay_no_panic() -> Result<(), GgrsError> {
         sess1.poll_remote_clients();
         sess2.poll_remote_clients();
 
-        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
-        sess2.add_local_input(1, StubInput { inp: i }).unwrap();
+        sess1
+            .add_local_input(PlayerHandle(0), StubInput { inp: i })
+            .unwrap();
+        sess2
+            .add_local_input(PlayerHandle(1), StubInput { inp: i })
+            .unwrap();
 
         let requests1 = sess1.advance_frame().unwrap();
         let requests2 = sess2.advance_frame().unwrap();

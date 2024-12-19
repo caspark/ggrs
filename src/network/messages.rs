@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::{Frame, NULL_FRAME};
+use crate::{Frame, PlayerHandle, NULL_FRAME};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ConnectionStatus {
@@ -19,7 +21,7 @@ impl Default for ConnectionStatus {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Input {
-    pub peer_connect_status: Vec<ConnectionStatus>,
+    pub peer_connect_status: HashMap<PlayerHandle, ConnectionStatus>,
     pub disconnect_requested: bool,
     pub start_frame: Frame,
     pub ack_frame: Frame,
@@ -29,7 +31,7 @@ pub(crate) struct Input {
 impl Default for Input {
     fn default() -> Self {
         Self {
-            peer_connect_status: Vec::new(),
+            peer_connect_status: HashMap::new(),
             disconnect_requested: false,
             start_frame: NULL_FRAME,
             ack_frame: NULL_FRAME,

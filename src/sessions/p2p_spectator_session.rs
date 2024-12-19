@@ -1,4 +1,4 @@
-use std::collections::{vec_deque::Drain, VecDeque};
+use std::collections::{vec_deque::Drain, BTreeSet, HashMap, VecDeque};
 
 use crate::{
     error::NetworkStatsError,
@@ -9,7 +9,7 @@ use crate::{
     },
     sessions::builder::MAX_EVENT_QUEUE_SIZE,
     Config, Frame, GgrsError, GgrsEvent, GgrsRequest, InputStatus, NetworkStats, NonBlockingSocket,
-    NULL_FRAME,
+    PlayerHandle, NULL_FRAME,
 };
 
 // The amount of frames the spectator advances in a single step if not too far behind
@@ -24,9 +24,8 @@ pub struct SpectatorSession<T>
 where
     T: Config,
 {
-    num_players: usize,
-    inputs: Vec<Vec<PlayerInput<T::Input>>>,
-    host_connect_status: Vec<ConnectionStatus>,
+    inputs: Vec<HashMap<PlayerHandle, PlayerInput<T::Input>>>,
+    host_connect_status: HashMap<PlayerHandle, ConnectionStatus>,
     socket: Box<dyn NonBlockingSocket<T::Address>>,
     host: UdpProtocol<T>,
     event_queue: VecDeque<GgrsEvent<T>>,
@@ -41,24 +40,31 @@ impl<T: Config> SpectatorSession<T> {
     /// The session will receive inputs from all players from the given host directly.
     /// The session will use the provided socket.
     pub(crate) fn new(
-        num_players: usize,
+        player_handles: BTreeSet<PlayerHandle>,
         socket: Box<dyn NonBlockingSocket<T::Address>>,
         host: UdpProtocol<T>,
         max_frames_behind: usize,
         catchup_speed: usize,
     ) -> Self {
         // host connection status
-        let mut host_connect_status = Vec::new();
-        for _ in 0..num_players {
-            host_connect_status.push(ConnectionStatus::default());
-        }
+        let host_connect_status = player_handles
+            .iter()
+            .map(|h| (*h, ConnectionStatus::default()))
+            .collect();
+
+        let inputs = {
+            let blank_input = PlayerInput::blank_input(NULL_FRAME);
+            let frame_blank_input: HashMap<PlayerHandle, PlayerInput<T::Input>> = player_handles
+                .iter()
+                .map(|h| (*h, blank_input.clone()))
+                .collect();
+            (0..SPECTATOR_BUFFER_SIZE)
+                .map(|_| frame_blank_input.clone())
+                .collect()
+        };
 
         Self {
-            num_players,
-            inputs: vec![
-                vec![PlayerInput::blank_input(NULL_FRAME); num_players];
-                SPECTATOR_BUFFER_SIZE
-            ],
+            inputs,
             host_connect_status,
             socket,
             host,
@@ -162,36 +168,42 @@ impl<T: Config> SpectatorSession<T> {
 
     /// Returns the number of players this session was constructed with.
     pub fn num_players(&self) -> usize {
-        self.num_players
+        self.host_connect_status.len()
     }
 
     fn inputs_at_frame(
         &self,
         frame_to_grab: Frame,
-    ) -> Result<Vec<(T::Input, InputStatus)>, GgrsError> {
+    ) -> Result<HashMap<PlayerHandle, (T::Input, InputStatus)>, GgrsError> {
         let player_inputs = &self.inputs[frame_to_grab as usize % SPECTATOR_BUFFER_SIZE];
 
+        let first_player_input = player_inputs.values().next().expect(
+            "Should always be able to get input for players because \
+            ring buffer of inputs is populated with blank inputs initially",
+        );
+
         // We haven't received the input from the host yet. Wait.
-        if player_inputs[0].frame < frame_to_grab {
+        if first_player_input.frame < frame_to_grab {
             return Err(GgrsError::PredictionThreshold);
         }
 
         // The host is more than [`SPECTATOR_BUFFER_SIZE`] frames ahead of the spectator. The input we need is gone forever.
-        if player_inputs[0].frame > frame_to_grab {
+        if first_player_input.frame > frame_to_grab {
             return Err(GgrsError::SpectatorTooFarBehind);
         }
 
         Ok(player_inputs
             .iter()
-            .enumerate()
             .map(|(handle, player_input)| {
-                if self.host_connect_status[handle].disconnected
+                let player_input = player_input.input.clone();
+                let status = if self.host_connect_status[handle].disconnected
                     && self.host_connect_status[handle].last_frame < frame_to_grab
                 {
-                    (player_input.input.clone(), InputStatus::Disconnected)
+                    InputStatus::Disconnected
                 } else {
-                    (player_input.input.clone(), InputStatus::Confirmed)
-                }
+                    InputStatus::Confirmed
+                };
+                (*handle, (player_input, status))
             })
             .collect())
     }
@@ -216,18 +228,21 @@ impl<T: Config> SpectatorSession<T> {
             }
             // add the input and all associated information
             Event::Input { input, player } => {
-                // save the input
+                // save the input if it corresponds to a known player
                 let input_idx = input.frame as usize % SPECTATOR_BUFFER_SIZE;
-                assert!(input.frame >= self.last_recv_frame);
-                self.last_recv_frame = input.frame;
-                self.inputs[input_idx][player] = input;
+                if let Some(stored_player_input) = self.inputs[input_idx].get_mut(&player) {
+                    assert!(input.frame >= self.last_recv_frame);
+                    self.last_recv_frame = input.frame;
+                    *stored_player_input = input;
 
-                // update the frame advantage
-                self.host.update_local_frame_advantage(self.last_recv_frame);
+                    // update the frame advantage
+                    self.host.update_local_frame_advantage(self.last_recv_frame);
 
-                // update the host connection status
-                for i in 0..self.num_players {
-                    self.host_connect_status[i] = self.host.peer_connect_status(i);
+                    // update the host connection status
+                    for (player_handle, host_connect_status) in self.host_connect_status.iter_mut()
+                    {
+                        *host_connect_status = self.host.peer_connect_status(*player_handle);
+                    }
                 }
             }
         }

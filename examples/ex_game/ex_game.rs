@@ -1,4 +1,7 @@
-use std::net::SocketAddr;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    net::SocketAddr,
+};
 
 use ggrs::{
     Config, Frame, GameStateCell, GgrsRequest, InputStatus, PlayerHandle, PredictRepeatLast,
@@ -56,20 +59,21 @@ fn fletcher16(data: &[u8]) -> u16 {
 
 // BoxGame will handle rendering, gamestate, inputs and GgrsRequests
 pub struct Game {
-    num_players: usize,
     game_state: State,
-    local_handles: Vec<PlayerHandle>,
+    local_handles: BTreeSet<PlayerHandle>,
     last_checksum: (Frame, u64),
     periodic_checksum: (Frame, u64),
 }
 
 impl Game {
-    pub fn new(num_players: usize) -> Self {
-        assert!(num_players <= 4);
+    pub fn new(all_players: BTreeSet<PlayerHandle>) -> Self {
+        assert!(
+            all_players.len() <= 4,
+            "Game currently only supports up to 4 players"
+        );
         Self {
-            num_players,
-            game_state: State::new(num_players),
-            local_handles: Vec::new(),
+            game_state: State::new(all_players),
+            local_handles: BTreeSet::new(),
             last_checksum: (NULL_FRAME, 0),
             periodic_checksum: (NULL_FRAME, 0),
         }
@@ -112,7 +116,7 @@ impl Game {
         self.game_state = cell.load().expect("No data found.");
     }
 
-    fn advance_frame(&mut self, inputs: Vec<(Input, InputStatus)>) {
+    fn advance_frame(&mut self, inputs: HashMap<PlayerHandle, (Input, InputStatus)>) {
         // advance the game state
         self.game_state.advance(inputs);
 
@@ -131,16 +135,16 @@ impl Game {
         clear_background(BLACK);
 
         // render players
-        for i in 0..self.num_players {
-            let color = match i {
+        for ship in self.game_state.players.values() {
+            let color = match ship.chosen_color {
                 0 => GOLD,
                 1 => BLUE,
                 2 => GREEN,
                 3 => RED,
                 _ => WHITE,
             };
-            let (x, y) = self.game_state.positions[i];
-            let rotation = self.game_state.rotations[i] + std::f32::consts::PI / 2.0;
+            let (x, y) = ship.position;
+            let rotation = ship.rotation + std::f32::consts::PI / 2.0;
             let v1 = Vec2::new(
                 x + rotation.sin() * SHIP_HEIGHT / 2.,
                 y - rotation.cos() * SHIP_HEIGHT / 2.,
@@ -178,7 +182,7 @@ impl Game {
     }
 
     #[allow(dead_code)]
-    pub fn register_local_handles(&mut self, handles: Vec<PlayerHandle>) {
+    pub fn register_local_handles(&mut self, handles: BTreeSet<PlayerHandle>) {
         self.local_handles = handles
     }
 
@@ -188,12 +192,17 @@ impl Game {
         // manually teleport the player to the center of the screen, but not through a proper input
         // this will create a forced desync (unless player one is already at the center)
         if is_key_pressed(KeyCode::Space) {
-            self.game_state.positions[handle] = (WINDOW_WIDTH * 0.5, WINDOW_HEIGHT * 0.5);
+            self.game_state.players.get_mut(&handle).unwrap().position =
+                (WINDOW_WIDTH * 0.5, WINDOW_HEIGHT * 0.5);
         }
 
         let mut inp: u8 = 0;
 
-        if handle == self.local_handles[0] {
+        let player_one_handle = *self
+            .local_handles
+            .first()
+            .expect("local input should only be collected if there is at least one local player");
+        if handle == player_one_handle {
             // first local player with WASD
             if is_key_down(KeyCode::W) {
                 inp |= INPUT_UP;
@@ -232,58 +241,65 @@ impl Game {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Ship {
+    pub position: (f32, f32),
+    pub velocity: (f32, f32),
+    pub rotation: f32,
+    pub chosen_color: usize,
+}
+
 // BoxGameState holds all relevant information about the game state
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct State {
     pub frame: i32,
-    pub num_players: usize,
-    pub positions: Vec<(f32, f32)>,
-    pub velocities: Vec<(f32, f32)>,
-    pub rotations: Vec<f32>,
+    pub players: BTreeMap<PlayerHandle, Ship>,
 }
 
 impl State {
-    pub fn new(num_players: usize) -> Self {
-        let mut positions = Vec::new();
-        let mut velocities = Vec::new();
-        let mut rotations = Vec::new();
-
+    pub fn new(all_players: BTreeSet<PlayerHandle>) -> Self {
         let r = WINDOW_WIDTH / 4.0;
+        let num_players = all_players.len();
 
-        for i in 0..num_players as i32 {
-            let rot = i as f32 / num_players as f32 * 2.0 * std::f32::consts::PI;
-            let x = WINDOW_WIDTH / 2.0 + r * rot.cos();
-            let y = WINDOW_HEIGHT / 2.0 + r * rot.sin();
-            positions.push((x, y));
-            velocities.push((0.0, 0.0));
-            rotations.push((rot + std::f32::consts::PI) % (2.0 * std::f32::consts::PI));
-        }
+        let players = all_players
+            .into_iter()
+            .enumerate()
+            .map(|(i, player_handle)| {
+                let rot = player_handle.0 as f32 / num_players as f32 * 2.0 * std::f32::consts::PI;
+                let x = WINDOW_WIDTH / 2.0 + r * rot.cos();
+                let y = WINDOW_HEIGHT / 2.0 + r * rot.sin();
+                (
+                    player_handle,
+                    Ship {
+                        position: (x, y),
+                        velocity: (0.0, 0.0),
+                        rotation: rot,
+                        chosen_color: i,
+                    },
+                )
+            })
+            .collect();
 
-        Self {
-            frame: 0,
-            num_players,
-            positions,
-            velocities,
-            rotations,
-        }
+        Self { frame: 0, players }
     }
 
-    pub fn advance(&mut self, inputs: Vec<(Input, InputStatus)>) {
+    pub fn advance(&mut self, inputs: HashMap<PlayerHandle, (Input, InputStatus)>) {
         // increase the frame counter
         self.frame += 1;
 
-        for i in 0..self.num_players {
+        for (player_handle, ship) in self.players.iter_mut() {
             // get input of that player
-            let input = match inputs[i].1 {
-                InputStatus::Confirmed => inputs[i].0.inp,
-                InputStatus::Predicted => inputs[i].0.inp,
+            let (player_input, player_input_status) = inputs[player_handle];
+            let input = match player_input_status {
+                InputStatus::Confirmed => player_input.inp,
+                InputStatus::Predicted => player_input.inp,
                 InputStatus::Disconnected => 4, // disconnected players spin
             };
 
             // old values
-            let (old_x, old_y) = self.positions[i];
-            let (old_vel_x, old_vel_y) = self.velocities[i];
-            let mut rot = self.rotations[i];
+            let (old_x, old_y) = ship.position;
+            let (old_vel_x, old_vel_y) = ship.velocity;
+            let mut rot = ship.rotation;
 
             // slow down
             let mut vel_x = old_vel_x * FRICTION;
@@ -326,9 +342,9 @@ impl State {
             y = y.min(WINDOW_HEIGHT);
 
             // update all state
-            self.positions[i] = (x, y);
-            self.velocities[i] = (vel_x, vel_y);
-            self.rotations[i] = rot;
+            ship.position = (x, y);
+            ship.velocity = (vel_x, vel_y);
+            ship.rotation = rot;
         }
     }
 }

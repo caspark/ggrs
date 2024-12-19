@@ -13,8 +13,8 @@ use crate::{
 use tracing::{debug, trace, warn};
 
 use std::collections::vec_deque::Drain;
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 
 const RECOMMENDATION_INTERVAL: Frame = 60;
@@ -52,7 +52,7 @@ impl<T: Config> PlayerRegistry<T> {
         }
     }
 
-    pub(crate) fn local_player_handles(&self) -> Vec<PlayerHandle> {
+    pub(crate) fn local_player_handles(&self) -> BTreeSet<PlayerHandle> {
         self.handles
             .iter()
             .filter_map(|(k, v)| match v {
@@ -63,7 +63,7 @@ impl<T: Config> PlayerRegistry<T> {
             .collect()
     }
 
-    pub(crate) fn remote_player_handles(&self) -> Vec<PlayerHandle> {
+    pub(crate) fn remote_player_handles(&self) -> BTreeSet<PlayerHandle> {
         self.handles
             .iter()
             .filter_map(|(k, v)| match v {
@@ -74,7 +74,19 @@ impl<T: Config> PlayerRegistry<T> {
             .collect()
     }
 
-    pub(crate) fn spectator_handles(&self) -> Vec<PlayerHandle> {
+    /// Local and remote player handles (excluding spectators)
+    pub(crate) fn playing_player_handles(&self) -> BTreeSet<PlayerHandle> {
+        self.handles
+            .iter()
+            .filter_map(|(k, v)| match v {
+                PlayerType::Local => Some(*k),
+                PlayerType::Remote(_) => Some(*k),
+                PlayerType::Spectator(_) => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn spectator_handles(&self) -> BTreeSet<PlayerHandle> {
         self.handles
             .iter()
             .filter_map(|(k, v)| match v {
@@ -85,7 +97,8 @@ impl<T: Config> PlayerRegistry<T> {
             .collect()
     }
 
-    pub(crate) fn num_players(&self) -> usize {
+    /// Sum of local and remote players (excluding spectators)
+    pub(crate) fn num_playing_players(&self) -> usize {
         self.handles
             .iter()
             .filter(|(_, v)| matches!(v, PlayerType::Local | PlayerType::Remote(_)))
@@ -99,9 +112,8 @@ impl<T: Config> PlayerRegistry<T> {
             .count()
     }
 
-    pub fn handles_by_address(&self, addr: T::Address) -> Vec<PlayerHandle> {
-        let handles: Vec<PlayerHandle> = self
-            .handles
+    pub fn handles_by_address(&self, addr: T::Address) -> BTreeSet<PlayerHandle> {
+        self.handles
             .iter()
             .filter_map(|(h, player_type)| match player_type {
                 PlayerType::Local => None,
@@ -109,8 +121,7 @@ impl<T: Config> PlayerRegistry<T> {
                 PlayerType::Spectator(a) => Some((h, a)),
             })
             .filter_map(|(h, a)| if addr == *a { Some(*h) } else { None })
-            .collect();
-        handles
+            .collect()
     }
 }
 
@@ -119,8 +130,6 @@ pub struct P2PSession<T>
 where
     T: Config,
 {
-    /// The number of players of the session.
-    num_players: usize,
     /// The maximum number of frames GGRS will roll back. Every gamestate older than this is guaranteed to be correct.
     max_prediction: usize,
     /// The sync layer handles player input queues and provides predictions.
@@ -136,7 +145,7 @@ where
     /// Handles players and their endpoints
     player_reg: PlayerRegistry<T>,
     /// This struct contains information about remote players, like connection status and the frame of last received input.
-    local_connect_status: Vec<ConnectionStatus>,
+    local_connect_status: HashMap<PlayerHandle, ConnectionStatus>,
 
     /// notes which inputs have already been sent to the spectators
     next_spectator_frame: Frame,
@@ -148,7 +157,7 @@ where
     /// Contains all events to be forwarded to the user.
     event_queue: VecDeque<GgrsEvent<T>>,
     /// Contains all local inputs not yet sent into the system. This should have inputs for every local player before calling advance_frame
-    local_inputs: HashMap<PlayerHandle, PlayerInput<T::Input>>,
+    local_inputs: BTreeMap<PlayerHandle, PlayerInput<T::Input>>,
 
     /// With desync detection, the session will compare checksums for all peers to detect discrepancies / desyncs between peers
     desync_detection: DesyncDetection,
@@ -162,7 +171,6 @@ impl<T: Config> P2PSession<T> {
     /// Creates a new [`P2PSession`] for players who participate on the game input. After creating the session, add local and remote players,
     /// set input delay for local players and then start the session. The session will use the provided socket.
     pub(crate) fn new(
-        num_players: usize,
         max_prediction: usize,
         socket: Box<dyn NonBlockingSocket<T::Address>>,
         players: PlayerRegistry<T>,
@@ -170,14 +178,17 @@ impl<T: Config> P2PSession<T> {
         desync_detection: DesyncDetection,
         input_delay: usize,
     ) -> Self {
+        let playing_player_handles: HashSet<_> =
+            players.playing_player_handles().into_iter().collect();
+
         // local connection status
-        let mut local_connect_status = Vec::new();
-        for _ in 0..num_players {
-            local_connect_status.push(ConnectionStatus::default());
-        }
+        let local_connect_status = playing_player_handles
+            .iter()
+            .map(|h| (*h, ConnectionStatus::default()))
+            .collect();
 
         // sync layer & set input delay
-        let mut sync_layer = SyncLayer::new(num_players, max_prediction);
+        let mut sync_layer = SyncLayer::new(playing_player_handles, max_prediction);
         for (player_handle, player_type) in players.handles.iter() {
             if let PlayerType::Local = player_type {
                 sync_layer.set_frame_delay(*player_handle, input_delay);
@@ -198,7 +209,6 @@ impl<T: Config> P2PSession<T> {
         };
 
         Self {
-            num_players,
             max_prediction,
             sparse_saving,
             socket,
@@ -210,7 +220,7 @@ impl<T: Config> P2PSession<T> {
             disconnect_frame: NULL_FRAME,
             player_reg: players,
             event_queue: VecDeque::new(),
-            local_inputs: HashMap::new(),
+            local_inputs: BTreeMap::new(),
             desync_detection,
             local_checksum_history: HashMap::new(),
             last_sent_checksum_frame: NULL_FRAME,
@@ -271,7 +281,7 @@ impl<T: Config> P2PSession<T> {
             if !self.local_inputs.contains_key(&handle) {
                 return Err(GgrsError::InvalidRequest {
                     info: format!(
-                        "Missing local input for handle {handle} while calling advance_frame()."
+                        "Missing local input for handle {handle:?} while calling advance_frame()."
                     ),
                 });
             }
@@ -374,7 +384,10 @@ impl<T: Config> P2PSession<T> {
             player_input.frame = actual_frame;
             // if the input has not been dropped
             if actual_frame != NULL_FRAME {
-                self.local_connect_status[handle].last_frame = actual_frame;
+                self.local_connect_status
+                    .get_mut(&handle)
+                    .expect("local player handle must be valid")
+                    .last_frame = actual_frame;
             }
         }
 
@@ -493,9 +506,15 @@ impl<T: Config> P2PSession<T> {
             }),
             // a remote player can only be disconnected if not already disconnected, since there is some additional logic attached
             Some(PlayerType::Remote(_)) => {
-                if !self.local_connect_status[player_handle].disconnected {
-                    let last_frame = self.local_connect_status[player_handle].last_frame;
-                    self.disconnect_player_at_frame(player_handle, last_frame);
+                let player_local_connect_status = *self
+                    .local_connect_status
+                    .get_mut(&player_handle)
+                    .expect("player handle to disconnect must be valid");
+                if !player_local_connect_status.disconnected {
+                    self.disconnect_player_at_frame(
+                        player_handle,
+                        player_local_connect_status.last_frame,
+                    );
                     return Ok(());
                 }
                 Err(GgrsError::InvalidRequest {
@@ -542,7 +561,7 @@ impl<T: Config> P2PSession<T> {
     pub fn confirmed_frame(&self) -> Frame {
         let mut confirmed_frame = i32::MAX;
 
-        for con_stat in &self.local_connect_status {
+        for con_stat in self.local_connect_status.values() {
             if !con_stat.disconnected {
                 confirmed_frame = std::cmp::min(confirmed_frame, con_stat.last_frame);
             }
@@ -577,7 +596,7 @@ impl<T: Config> P2PSession<T> {
 
     /// Returns the number of players added to this session
     pub fn num_players(&self) -> usize {
-        self.player_reg.num_players()
+        self.player_reg.num_playing_players()
     }
 
     /// Return the number of spectators currently registered
@@ -586,22 +605,22 @@ impl<T: Config> P2PSession<T> {
     }
 
     /// Returns the handles of local players that have been added
-    pub fn local_player_handles(&self) -> Vec<PlayerHandle> {
+    pub fn local_player_handles(&self) -> BTreeSet<PlayerHandle> {
         self.player_reg.local_player_handles()
     }
 
     /// Returns the handles of remote players that have been added
-    pub fn remote_player_handles(&self) -> Vec<PlayerHandle> {
+    pub fn remote_player_handles(&self) -> BTreeSet<PlayerHandle> {
         self.player_reg.remote_player_handles()
     }
 
     /// Returns the handles of spectators that have been added
-    pub fn spectator_handles(&self) -> Vec<PlayerHandle> {
+    pub fn spectator_handles(&self) -> BTreeSet<PlayerHandle> {
         self.player_reg.spectator_handles()
     }
 
     /// Returns all handles associated to a certain address
-    pub fn handles_by_address(&self, addr: T::Address) -> Vec<PlayerHandle> {
+    pub fn handles_by_address(&self, addr: T::Address) -> BTreeSet<PlayerHandle> {
         self.player_reg.handles_by_address(addr)
     }
 
@@ -631,8 +650,11 @@ impl<T: Config> P2PSession<T> {
                     .expect("There should be no address without registered endpoint");
 
                 // mark the affected players as disconnected
-                for &handle in endpoint.handles() {
-                    self.local_connect_status[handle].disconnected = true;
+                for handle in endpoint.handles() {
+                    self.local_connect_status
+                        .get_mut(&handle)
+                        .expect("player handle from endpoint must be valid")
+                        .disconnected = true;
                 }
                 endpoint.disconnect();
 
@@ -720,15 +742,13 @@ impl<T: Config> P2PSession<T> {
         }
 
         while self.next_spectator_frame <= confirmed_frame {
-            let mut inputs = self
+            let input_map = self
                 .sync_layer
                 .confirmed_inputs(self.next_spectator_frame, &self.local_connect_status);
-            assert_eq!(inputs.len(), self.num_players);
+            assert_eq!(input_map.len(), self.player_reg.num_playing_players());
 
-            let mut input_map = HashMap::new();
-            for (handle, input) in inputs.iter_mut().enumerate() {
+            for input in input_map.values() {
                 assert!(input.frame == NULL_FRAME || input.frame == self.next_spectator_frame);
-                input_map.insert(handle, input.clone());
             }
 
             // send it to all spectators
@@ -746,7 +766,8 @@ impl<T: Config> P2PSession<T> {
     /// Check if players are registered as disconnected for earlier frames on other remote players in comparison to our local assumption.
     /// Disconnect players that are disconnected for other players and update the frame they disconnected
     fn update_player_disconnects(&mut self) {
-        for handle in 0..self.num_players {
+        let mut to_disconnect = Vec::new();
+        for (handle, handle_connect_status) in self.local_connect_status.iter_mut() {
             let mut queue_connected = true;
             let mut queue_min_confirmed = i32::MAX;
 
@@ -755,7 +776,7 @@ impl<T: Config> P2PSession<T> {
                 if !endpoint.is_running() {
                     continue;
                 }
-                let con_status = endpoint.peer_connect_status(handle);
+                let con_status = endpoint.peer_connect_status(*handle);
                 let connected = !con_status.disconnected;
                 let min_confirmed = con_status.last_frame;
 
@@ -764,8 +785,8 @@ impl<T: Config> P2PSession<T> {
             }
 
             // check our local info for that player
-            let local_connected = !self.local_connect_status[handle].disconnected;
-            let local_min_confirmed = self.local_connect_status[handle].last_frame;
+            let local_connected = !handle_connect_status.disconnected;
+            let local_min_confirmed = handle_connect_status.last_frame;
 
             if local_connected {
                 queue_min_confirmed = std::cmp::min(queue_min_confirmed, local_min_confirmed);
@@ -776,9 +797,12 @@ impl<T: Config> P2PSession<T> {
                 // If so, we need to re-adjust. This can happen when we e.g. detect our own disconnect at frame n
                 // and later receive a disconnect notification for frame n-1.
                 if local_connected || local_min_confirmed > queue_min_confirmed {
-                    self.disconnect_player_at_frame(handle as PlayerHandle, queue_min_confirmed);
+                    to_disconnect.push((*handle, queue_min_confirmed));
                 }
             }
+        }
+        for (handle, frame) in to_disconnect {
+            self.disconnect_player_at_frame(handle, frame);
         }
     }
 
@@ -786,8 +810,8 @@ impl<T: Config> P2PSession<T> {
     fn max_frame_advantage(&self) -> i32 {
         let mut interval = i32::MIN;
         for endpoint in self.player_reg.remotes.values() {
-            for &handle in endpoint.handles() {
-                if !self.local_connect_status[handle].disconnected {
+            for handle in endpoint.handles() {
+                if !self.local_connect_status[&handle].disconnected {
                     interval = std::cmp::max(interval, endpoint.average_frame_advantage());
                 }
             }
@@ -846,7 +870,7 @@ impl<T: Config> P2PSession<T> {
     fn handle_event(
         &mut self,
         event: Event<T>,
-        player_handles: Vec<PlayerHandle>,
+        player_handles: BTreeSet<PlayerHandle>,
         addr: T::Address,
     ) {
         match event {
@@ -865,8 +889,8 @@ impl<T: Config> P2PSession<T> {
             // disconnect the player, then forward to user
             Event::Disconnected => {
                 for handle in player_handles {
-                    let last_frame = if handle < self.num_players as PlayerHandle {
-                        self.local_connect_status[handle].last_frame
+                    let last_frame = if self.player_reg.playing_player_handles().contains(&handle) {
+                        self.local_connect_status[&handle].last_frame
                     } else {
                         NULL_FRAME // spectator
                     };
@@ -878,17 +902,20 @@ impl<T: Config> P2PSession<T> {
             }
             // add the input and all associated information
             Event::Input { input, player } => {
-                // input only comes from remote players, not spectators
-                assert!(player < self.num_players as PlayerHandle);
-                if !self.local_connect_status[player].disconnected {
+                let player_connect_status = self
+                    .local_connect_status
+                    .get_mut(&player)
+                    .expect("input should come from known playing players (and not spectators)");
+
+                if !player_connect_status.disconnected {
                     // check if the input comes in the correct sequence
-                    let current_remote_frame = self.local_connect_status[player].last_frame;
+                    let current_remote_frame = player_connect_status.last_frame;
                     assert!(
                         current_remote_frame == NULL_FRAME
                             || current_remote_frame + 1 == input.frame
                     );
                     // update our info
-                    self.local_connect_status[player].last_frame = input.frame;
+                    player_connect_status.last_frame = input.frame;
                     // add the remote input
                     self.sync_layer.add_remote_input(player, input);
                 }

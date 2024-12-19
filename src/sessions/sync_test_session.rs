@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::error::GgrsError;
 use crate::frame_info::PlayerInput;
@@ -12,34 +12,32 @@ pub struct SyncTestSession<T>
 where
     T: Config,
 {
-    num_players: usize,
     max_prediction: usize,
     check_distance: usize,
     sync_layer: SyncLayer<T>,
-    dummy_connect_status: Vec<ConnectionStatus>,
+    dummy_connect_status: HashMap<PlayerHandle, ConnectionStatus>,
     checksum_history: HashMap<Frame, Option<u128>>,
     local_inputs: HashMap<PlayerHandle, PlayerInput<T::Input>>,
 }
 
 impl<T: Config> SyncTestSession<T> {
     pub(crate) fn new(
-        num_players: usize,
+        player_handles: HashSet<PlayerHandle>,
         max_prediction: usize,
         check_distance: usize,
         input_delay: usize,
     ) -> Self {
-        let mut dummy_connect_status = Vec::new();
-        for _ in 0..num_players {
-            dummy_connect_status.push(ConnectionStatus::default());
-        }
+        let dummy_connect_status = player_handles
+            .iter()
+            .map(|h| (*h, ConnectionStatus::default()))
+            .collect();
 
-        let mut sync_layer = SyncLayer::new(num_players, max_prediction);
-        for i in 0..num_players {
-            sync_layer.set_frame_delay(i, input_delay);
+        let mut sync_layer = SyncLayer::new(player_handles.clone(), max_prediction);
+        for player_handle in player_handles {
+            sync_layer.set_frame_delay(player_handle, input_delay);
         }
 
         Self {
-            num_players,
             max_prediction,
             check_distance,
             sync_layer,
@@ -63,11 +61,12 @@ impl<T: Config> SyncTestSession<T> {
         player_handle: PlayerHandle,
         input: T::Input,
     ) -> Result<(), GgrsError> {
-        if player_handle >= self.num_players {
+        if !self.dummy_connect_status.contains_key(&player_handle) {
             return Err(GgrsError::InvalidRequest {
                 info: "The player handle you provided is not valid.".to_owned(),
             });
         }
+
         let player_input = PlayerInput::<T::Input>::new(self.sync_layer.current_frame(), input);
         self.local_inputs.insert(player_handle, player_input);
         Ok(())
@@ -107,7 +106,7 @@ impl<T: Config> SyncTestSession<T> {
         }
 
         // we require inputs for all players
-        if self.num_players != self.local_inputs.len() {
+        if self.local_player_handles().len() != self.local_inputs.len() {
             return Err(GgrsError::InvalidRequest {
                 info: "Missing local input while calling advance_frame().".to_owned(),
             });
@@ -142,7 +141,7 @@ impl<T: Config> SyncTestSession<T> {
         self.sync_layer.set_last_confirmed_frame(safe_frame, false);
 
         // also, we update the dummy connect status to pretend that we received inputs from all players
-        for con_stat in &mut self.dummy_connect_status {
+        for con_stat in &mut self.dummy_connect_status.values_mut() {
             con_stat.last_frame = self.sync_layer.current_frame();
         }
 
@@ -154,9 +153,14 @@ impl<T: Config> SyncTestSession<T> {
         self.sync_layer.current_frame()
     }
 
+    /// Returns the handles of local players that have been added
+    pub fn local_player_handles(&self) -> BTreeSet<PlayerHandle> {
+        self.dummy_connect_status.keys().copied().collect()
+    }
+
     /// Returns the number of players this session was constructed with.
     pub fn num_players(&self) -> usize {
-        self.num_players
+        self.dummy_connect_status.len()
     }
 
     /// Returns the maximum prediction window of a session.

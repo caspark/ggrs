@@ -1,10 +1,13 @@
 use rand::{prelude::ThreadRng, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 
-use ggrs::{Config, Frame, GameStateCell, GgrsRequest, InputStatus, PredictRepeatLast};
+use ggrs::{
+    Config, Frame, GameStateCell, GgrsRequest, InputStatus, PlayerHandle, PredictRepeatLast,
+};
 
 fn calculate_hash<T: Hash>(t: &T) -> u64 {
     let mut s = DefaultHasher::new();
@@ -60,7 +63,7 @@ impl GameStub {
         self.gs = cell.load().unwrap();
     }
 
-    fn advance_frame(&mut self, inputs: Vec<(StubInput, InputStatus)>) {
+    fn advance_frame(&mut self, inputs: HashMap<PlayerHandle, (StubInput, InputStatus)>) {
         self.gs.advance_frame(inputs);
     }
 }
@@ -101,7 +104,7 @@ impl RandomChecksumGameStub {
         self.gs = cell.load().expect("No data found.");
     }
 
-    fn advance_frame(&mut self, inputs: Vec<(StubInput, InputStatus)>) {
+    fn advance_frame(&mut self, inputs: HashMap<PlayerHandle, (StubInput, InputStatus)>) {
         self.gs.advance_frame(inputs);
     }
 }
@@ -113,9 +116,12 @@ pub struct StateStub {
 }
 
 impl StateStub {
-    fn advance_frame(&mut self, inputs: Vec<(StubInput, InputStatus)>) {
-        let p0_inputs = inputs[0].0.inp;
-        let p1_inputs = inputs.get(1).map(|i| i.0.inp).unwrap_or_default();
+    fn advance_frame(&mut self, inputs: HashMap<PlayerHandle, (StubInput, InputStatus)>) {
+        let p0_inputs = inputs[&PlayerHandle(0)].0.inp;
+        let p1_inputs = inputs
+            .get(&PlayerHandle(1))
+            .map(|i| i.0.inp)
+            .unwrap_or_default();
 
         if (p0_inputs + p1_inputs) % 2 == 0 {
             self.state += 2;
