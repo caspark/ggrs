@@ -7,13 +7,13 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 //#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
-use std::{fmt::Debug, hash::Hash};
+use std::{collections::HashMap, fmt::Debug, hash::Hash};
 
 pub use error::GgrsError;
 pub use network::messages::Message;
 pub use network::network_stats::NetworkStats;
 pub use network::udp_socket::UdpNonBlockingSocket;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 pub use sessions::builder::SessionBuilder;
 pub use sessions::p2p_session::P2PSession;
 pub use sessions::p2p_spectator_session::SpectatorSession;
@@ -48,7 +48,9 @@ pub const NULL_FRAME: i32 = -1;
 /// A frame is a single step of execution.
 pub type Frame = i32;
 /// Each player is identified by a player handle.
-pub type PlayerHandle = usize;
+#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(transparent)]
+struct PlayerHandle(pub u64);
 
 // #############
 // #   ENUMS   #
@@ -190,7 +192,7 @@ where
     /// Disconnected players are indicated by having [`NULL_FRAME`] instead of the correct current frame in their input.
     AdvanceFrame {
         /// Contains inputs and input status for each player.
-        inputs: Vec<(T::Input, InputStatus)>,
+        inputs: HashMap<PlayerHandle, (T::Input, InputStatus)>,
     },
 }
 

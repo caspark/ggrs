@@ -1,17 +1,17 @@
 use crate::error::NetworkStatsError;
 use crate::frame_info::PlayerInput;
-use crate::network::compression::{decode, encode};
+use crate::network::compression::{decode, encode, encode_player_handles};
 use crate::network::messages::{
     ChecksumReport, ConnectionStatus, Input, InputAck, Message, MessageBody, MessageHeader,
     QualityReply, QualityReport,
 };
 use crate::time_sync::TimeSync;
 use crate::{Config, DesyncDetection, Frame, NonBlockingSocket, PlayerHandle, NULL_FRAME};
-use tracing::trace;
+use tracing::{debug, trace};
 
 use instant::{Duration, Instant};
 use std::collections::vec_deque::Drain;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::ops::Add;
 
@@ -45,51 +45,59 @@ fn millis_since_epoch() -> u128 {
 struct InputBytes {
     /// The frame to which this info belongs to. -1/[`NULL_FRAME`] represents an invalid frame
     pub frame: Frame,
+    /// Player handles; in theory, it's redundant to include these while all clients have the same
+    /// player handles, but it ought to be useful for debugging and any future hot join support.
+    pub handles: Vec<PlayerHandle>,
     /// An input buffer that will hold input data
     pub bytes: Vec<u8>,
 }
 
 impl InputBytes {
-    fn zeroed<T: Config>(num_players: usize) -> Self {
-        let size = core::mem::size_of::<T::Input>() * num_players;
+    fn zeroed<T: Config>(handles: Vec<PlayerHandle>) -> Self {
+        let size = core::mem::size_of::<T::Input>() * handles.len();
         Self {
             frame: NULL_FRAME,
+            handles: handles,
             bytes: vec![0; size],
         }
     }
 
-    fn from_inputs<T: Config>(
-        num_players: usize,
-        inputs: &HashMap<PlayerHandle, PlayerInput<T::Input>>,
-    ) -> Self {
-        let mut bytes = Vec::new();
+    fn from_inputs<T: Config>(inputs: &HashMap<PlayerHandle, PlayerInput<T::Input>>) -> Self {
         let mut frame = NULL_FRAME;
-        // in ascending order
-        for handle in 0..num_players {
-            if let Some(input) = inputs.get(&handle) {
-                assert!(frame == NULL_FRAME || input.frame == NULL_FRAME || frame == input.frame);
-                if input.frame != NULL_FRAME {
-                    frame = input.frame;
-                }
-
-                bincode::serialize_into(&mut bytes, &input.input)
-                    .expect("input serialization failed");
+        let mut handles = Vec::new();
+        let mut bytes = Vec::new();
+        for (handle, input) in inputs.iter() {
+            assert!(frame == NULL_FRAME || input.frame == NULL_FRAME || frame == input.frame);
+            if input.frame != NULL_FRAME {
+                frame = input.frame;
             }
+
+            handles.push(*handle);
+
+            bincode::serialize_into(&mut bytes, &input.input).expect("input serialization failed");
         }
-        Self { frame, bytes }
+        Self {
+            frame,
+            handles,
+            bytes,
+        }
     }
 
-    fn to_player_inputs<T: Config>(&self, num_players: usize) -> Vec<PlayerInput<T::Input>> {
-        let mut player_inputs = Vec::new();
-        assert!(self.bytes.len() % num_players == 0);
-        let size = self.bytes.len() / num_players;
-        for p in 0..num_players {
-            let start = p * size;
-            let end = start + size;
-            let player_byte_slice = &self.bytes[start..end];
+    fn to_player_inputs<T: Config>(&self) -> HashMap<PlayerHandle, PlayerInput<T::Input>> {
+        let mut player_inputs = HashMap::new();
+        assert!(
+            self.bytes.len() % self.handles.len() == 0,
+            "input bytes length must be a multiple of player handle count"
+        );
+        let per_player_size = self.bytes.len() / self.handles.len();
+        for (handle, player_byte_slice) in self
+            .handles
+            .iter()
+            .zip(self.bytes.chunks_exact(per_player_size))
+        {
             let input: T::Input =
                 bincode::deserialize(player_byte_slice).expect("input deserialization failed");
-            player_inputs.push(PlayerInput::new(self.frame, input));
+            player_inputs.insert(*handle, PlayerInput::new(self.frame, input));
         }
         player_inputs
     }
@@ -124,8 +132,6 @@ pub(crate) struct UdpProtocol<T>
 where
     T: Config,
 {
-    num_players: usize,
-    handles: Vec<PlayerHandle>,
     send_queue: VecDeque<Message>,
     event_queue: VecDeque<Event<T>>,
 
@@ -146,13 +152,13 @@ where
     // the other client
     peer_addr: T::Address,
     // remote_magic: u16,
-    peer_connect_status: Vec<ConnectionStatus>,
+    peer_connect_status: HashMap<PlayerHandle, ConnectionStatus>,
 
     // input compression
-    pending_output: VecDeque<InputBytes>,
-    last_acked_input: InputBytes,
+    pending_output: VecDeque<InputBytes>, // input we're going to send
+    last_acked_input: InputBytes,         // we delta-encode inputs we send relative to this
     max_prediction: usize,
-    recv_inputs: HashMap<Frame, InputBytes>,
+    recv_inputs: HashMap<Frame, InputBytes>, // we delta-decode inputs received relative to these old received inputs
 
     // time sync
     time_sync_layer: TimeSync,
@@ -180,10 +186,13 @@ impl<T: Config> PartialEq for UdpProtocol<T> {
 
 impl<T: Config> UdpProtocol<T> {
     pub(crate) fn new(
-        mut handles: Vec<PlayerHandle>,
+        // handles == the handles that are at this address
+        handles: HashSet<PlayerHandle>,
         peer_addr: T::Address,
-        num_players: usize,
-        local_players: usize,
+        // local player handles == the player handles that we send inputs for (to this remote client)
+        // e.g. for a spectator, we send input for all players
+        // e.g. for p2p session remote players, we send input for only local players
+        local_player_handles: HashSet<PlayerHandle>,
         max_prediction: usize,
         disconnect_timeout: Duration,
         disconnect_notify_start: Duration,
@@ -195,22 +204,24 @@ impl<T: Config> UdpProtocol<T> {
             magic = rand::random::<u16>();
         }
 
-        handles.sort_unstable();
-        let recv_player_num = handles.len();
-
         // peer connection status
-        let mut peer_connect_status = Vec::new();
-        for _ in 0..num_players {
-            peer_connect_status.push(ConnectionStatus::default());
-        }
+        let peer_connect_status = handles
+            .iter()
+            .copied()
+            .map(|h| (h, ConnectionStatus::default()))
+            .collect();
 
         // received input history
         let mut recv_inputs = HashMap::new();
-        recv_inputs.insert(NULL_FRAME, InputBytes::zeroed::<T>(recv_player_num));
+
+        // zeroed input is put into the received inputs so that it can be read to be the reference
+        // when we're decoding the very first received input
+        recv_inputs.insert(
+            NULL_FRAME,
+            InputBytes::zeroed::<T>(handles.iter().copied().collect()),
+        );
 
         Self {
-            num_players,
-            handles,
             send_queue: VecDeque::new(),
             event_queue: VecDeque::new(),
 
@@ -234,7 +245,9 @@ impl<T: Config> UdpProtocol<T> {
 
             // input compression
             pending_output: VecDeque::with_capacity(PENDING_OUTPUT_SIZE),
-            last_acked_input: InputBytes::zeroed::<T>(local_players),
+            last_acked_input: InputBytes::zeroed::<T>(
+                local_player_handles.iter().copied().collect(),
+            ),
             max_prediction,
             recv_inputs,
 
@@ -292,8 +305,8 @@ impl<T: Config> UdpProtocol<T> {
         })
     }
 
-    pub(crate) fn handles(&self) -> &Vec<PlayerHandle> {
-        &self.handles
+    pub(crate) fn handles(&self) -> impl Iterator<Item = PlayerHandle> + '_ {
+        self.peer_connect_status.keys().copied()
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -305,7 +318,7 @@ impl<T: Config> UdpProtocol<T> {
     }
 
     pub(crate) fn peer_connect_status(&self, handle: PlayerHandle) -> ConnectionStatus {
-        self.peer_connect_status[handle]
+        self.peer_connect_status[&handle]
     }
 
     pub(crate) fn disconnect(&mut self) {
@@ -326,7 +339,10 @@ impl<T: Config> UdpProtocol<T> {
         self.peer_addr.clone()
     }
 
-    pub(crate) fn poll(&mut self, connect_status: &[ConnectionStatus]) -> Drain<Event<T>> {
+    pub(crate) fn poll(
+        &mut self,
+        connect_status: &HashMap<PlayerHandle, ConnectionStatus>,
+    ) -> Drain<Event<T>> {
         let now = Instant::now();
         match self.state {
             ProtocolState::Running => {
@@ -421,13 +437,13 @@ impl<T: Config> UdpProtocol<T> {
     pub(crate) fn send_input(
         &mut self,
         inputs: &HashMap<PlayerHandle, PlayerInput<T::Input>>,
-        connect_status: &[ConnectionStatus],
+        connect_status: &HashMap<PlayerHandle, ConnectionStatus>,
     ) {
         if self.state != ProtocolState::Running {
             return;
         }
 
-        let endpoint_data = InputBytes::from_inputs::<T>(self.num_players, inputs);
+        let endpoint_data = InputBytes::from_inputs::<T>(inputs);
 
         // register the input and advantages in the time sync layer
         self.time_sync_layer.advance_frame(
@@ -447,18 +463,15 @@ impl<T: Config> UdpProtocol<T> {
         self.send_pending_output(connect_status);
     }
 
-    fn send_pending_output(&mut self, connect_status: &[ConnectionStatus]) {
-        let mut body = Input::default();
-
-        if let Some(input) = self.pending_output.front() {
+    fn send_pending_output(&mut self, connect_status: &HashMap<PlayerHandle, ConnectionStatus>) {
+        if let Some(oldest_input_to_send) = self.pending_output.front() {
             assert!(
                 self.last_acked_input.frame == NULL_FRAME
-                    || self.last_acked_input.frame + 1 == input.frame
+                    || self.last_acked_input.frame + 1 == oldest_input_to_send.frame
             );
-            body.start_frame = input.frame;
 
             // encode all pending inputs to a byte buffer
-            body.bytes = encode(
+            let bytes = encode(
                 &self.last_acked_input.bytes,
                 self.pending_output
                     .iter()
@@ -475,14 +488,23 @@ impl<T: Config> UdpProtocol<T> {
                     sum
                 },
                 self.pending_output.len(),
-                body.bytes.len()
+                bytes.len()
             );
 
-            body.ack_frame = self.last_recv_frame();
-            body.disconnect_requested = self.state == ProtocolState::Disconnected;
-            connect_status.clone_into(&mut body.peer_connect_status);
+            // encode the player handles
+            let player_bytes = encode_player_handles(
+                &self.last_acked_input.handles,
+                self.pending_output.iter().map(|gi| gi.handles.as_slice()),
+            );
 
-            self.queue_message(MessageBody::Input(body));
+            self.queue_message(MessageBody::Input(Input {
+                peer_connect_status: connect_status.clone(),
+                disconnect_requested: self.state == ProtocolState::Disconnected,
+                start_frame: oldest_input_to_send.frame,
+                ack_frame: self.last_recv_frame(),
+                handle_bytes: todo!(),
+                bytes,
+            }));
         }
     }
 
@@ -574,12 +596,19 @@ impl<T: Config> UdpProtocol<T> {
             }
         } else {
             // update the peer connection status
-            for i in 0..self.peer_connect_status.len() {
-                self.peer_connect_status[i].disconnected = body.peer_connect_status[i].disconnected
-                    || self.peer_connect_status[i].disconnected;
-                self.peer_connect_status[i].last_frame = std::cmp::max(
-                    self.peer_connect_status[i].last_frame,
-                    body.peer_connect_status[i].last_frame,
+            for (handle, peer_connect_status) in self.peer_connect_status.iter_mut() {
+                let Some(body_peer_connect_status) = body.peer_connect_status.get(handle) else {
+                    // we have a handle that the peer does not know about
+                    debug!("Remote peer did not include connection status for handle {handle:?}");
+                    // TODO should we handle the case where the peer sent a handle that we do not know about?
+                    continue;
+                };
+
+                peer_connect_status.disconnected =
+                    body_peer_connect_status.disconnected || peer_connect_status.disconnected;
+                peer_connect_status.last_frame = std::cmp::max(
+                    peer_connect_status.last_frame,
+                    body_peer_connect_status.last_frame,
                 );
             }
         }

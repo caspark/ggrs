@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::PlayerHandle;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct EncodedInputSequence {
     /// Size of each input in the sequence relative to the reference input for the first input, and
@@ -179,6 +181,21 @@ fn delta_decode(
     }
 
     Ok(decoded_inputs)
+}
+
+pub(crate) fn encode_player_handles<'a, I: Iterator<Item = &'a [PlayerHandle]>>(
+    base: &[PlayerHandle],
+    inputs: I,
+) -> Vec<u8> {
+    //TODO do this, or fold it into the existing encode functionality
+    todo!()
+}
+
+pub(crate) fn decode_player_handles(
+    base: &[PlayerHandle],
+    encoded_bytes: &[u8],
+) -> Vec<Vec<PlayerHandle>> {
+    todo!()
 }
 
 // #########
