@@ -29,7 +29,7 @@ const MAX_SPEED: f32 = 7.0;
 const FRICTION: f32 = 0.98;
 
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Input {
     pub inp: u8,
 }
@@ -289,7 +289,7 @@ impl State {
 
         for (player_handle, ship) in self.players.iter_mut() {
             // get input of that player
-            let (player_input, player_input_status) = inputs[player_handle];
+            let (player_input, player_input_status) = &inputs[player_handle];
             let input = match player_input_status {
                 InputStatus::Confirmed => player_input.inp,
                 InputStatus::Predicted => player_input.inp,

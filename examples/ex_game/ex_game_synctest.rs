@@ -46,10 +46,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::from_args();
 
     // create a GGRS session
-    let mut sess = SessionBuilder::new()
+    let mut sess_build = SessionBuilder::new()
         .with_check_distance(opt.check_distance)
-        .with_input_delay(2)
-        .start_synctest_session()?;
+        .with_input_delay(2);
+
+    // add players
+    for i in 0..opt.num_players {
+        sess_build = sess_build.add_player(ggrs::PlayerType::Local, i.try_into()?)?;
+    }
+
+    let mut sess = sess_build.start_synctest_session()?;
 
     // Create a new box game
     let all_players: BTreeSet<PlayerHandle> = {
