@@ -2,8 +2,8 @@ use crate::error::NetworkStatsError;
 use crate::frame_info::PlayerInput;
 use crate::network::compression::{decode, encode};
 use crate::network::messages::{
-    ChecksumReport, ConnectionStatus, Input, InputAck, Message, MessageBody, MessageHeader,
-    QualityReply, QualityReport,
+    ChecksumReport, ConnectionStatus, Input, InputAck, Message, MessageBody, QualityReply,
+    QualityReport,
 };
 use crate::time_sync::TimeSync;
 use crate::{Config, DesyncDetection, Frame, NonBlockingSocket, PlayerHandle, NULL_FRAME};
@@ -141,7 +141,6 @@ where
     disconnect_notify_start: Duration,
     shutdown_timeout: Instant,
     fps: usize,
-    magic: u16,
 
     // the other client
     peer_addr: T::Address,
@@ -190,11 +189,6 @@ impl<T: Config> UdpProtocol<T> {
         fps: usize,
         desync_detection: DesyncDetection,
     ) -> Self {
-        let mut magic = rand::random::<u16>();
-        while magic == 0 {
-            magic = rand::random::<u16>();
-        }
-
         handles.sort_unstable();
         let recv_player_num = handles.len();
 
@@ -226,7 +220,6 @@ impl<T: Config> UdpProtocol<T> {
             disconnect_notify_start,
             shutdown_timeout: Instant::now(),
             fps,
-            magic,
 
             // the other client
             peer_addr,
@@ -414,7 +407,8 @@ impl<T: Config> UdpProtocol<T> {
 
         trace!("Sending {} messages over socket", self.send_queue.len());
         for msg in self.send_queue.drain(..) {
-            socket.send_to(&msg, &self.peer_addr);
+            let buf = bincode::serialize(&msg).unwrap();
+            socket.send_to(&buf, &self.peer_addr);
         }
     }
 
@@ -512,9 +506,7 @@ impl<T: Config> UdpProtocol<T> {
     fn queue_message(&mut self, body: MessageBody) {
         trace!("Queuing message to {:?}: {:?}", self.peer_addr, body);
 
-        // set the header
-        let header = MessageHeader { magic: self.magic };
-        let msg = Message { header, body };
+        let msg = Message { body };
 
         self.packets_sent += 1;
         self.last_send_time = Instant::now();

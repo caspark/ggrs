@@ -5,7 +5,7 @@ use std::{
 
 use tracing::warn;
 
-use crate::{network::messages::Message, NonBlockingSocket};
+use crate::NonBlockingSocket;
 
 const RECV_BUFFER_SIZE: usize = 4096;
 /// A packet larger than this may be fragmented, so ideally we wouldn't send packets larger than
@@ -34,9 +34,7 @@ impl UdpNonBlockingSocket {
 }
 
 impl NonBlockingSocket<SocketAddr> for UdpNonBlockingSocket {
-    fn send_to(&mut self, msg: &Message, addr: &SocketAddr) {
-        let buf = bincode::serialize(&msg).unwrap();
-
+    fn send_to(&mut self, buf: &[u8], addr: &SocketAddr) {
         // Overly large packets risk being fragmented, which can increase packet loss (any fragment
         // of a packet getting lost will cause the whole fragment to be lost), or increase latency
         // to be delayed (have to wait for all fragments to arrive).
@@ -47,7 +45,7 @@ impl NonBlockingSocket<SocketAddr> for UdpNonBlockingSocket {
         // encode well). So we should let the user of ggrs know about that, so they can fix it by
         // reducing the size of their input struct.
         //
-        // On the other hand, the occaisional large packet is kind of harmless - whether it gets
+        // On the other hand, the occasional large packet is kind of harmless - whether it gets
         // fragmented or not, the odds are that it will get through unless the connection is truly
         // horrible. So, we'll just log a warning.
         if buf.len() > IDEAL_MAX_UDP_PACKET_SIZE {
@@ -61,15 +59,12 @@ impl NonBlockingSocket<SocketAddr> for UdpNonBlockingSocket {
         self.socket.send_to(&buf, addr).unwrap();
     }
 
-    fn receive_all_messages(&mut self) -> Vec<(SocketAddr, Message)> {
+    fn receive_all_messages(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
         let mut received_messages = Vec::new();
         loop {
             match self.socket.recv_from(&mut self.buffer) {
                 Ok((number_of_bytes, src_addr)) => {
-                    assert!(number_of_bytes <= RECV_BUFFER_SIZE);
-                    if let Ok(msg) = bincode::deserialize(&self.buffer[0..number_of_bytes]) {
-                        received_messages.push((src_addr, msg));
-                    }
+                    received_messages.push((src_addr, self.buffer[0..number_of_bytes].to_vec()));
                 }
                 // there are no more messages
                 Err(ref err) if err.kind() == ErrorKind::WouldBlock => return received_messages,

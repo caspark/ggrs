@@ -1,7 +1,7 @@
 mod ex_game;
 
 use ex_game::{GGRSConfig, Game};
-use ggrs::{GgrsError, GgrsEvent, SessionBuilder, UdpNonBlockingSocket};
+use ggrs::{GgrsError, GgrsEvent, HandshakingSocket, SessionBuilder, UdpNonBlockingSocket};
 use instant::{Duration, Instant};
 use macroquad::prelude::*;
 use std::net::SocketAddr;
@@ -47,7 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::from_args();
 
     // create a GGRS session for a spectator
-    let socket = UdpNonBlockingSocket::bind_to_port(opt.local_port)?;
+    let mut socket = HandshakingSocket::wrap(UdpNonBlockingSocket::bind_to_port(opt.local_port)?);
+    socket.register(opt.host);
     let mut sess = SessionBuilder::<GGRSConfig>::new()
         .with_num_players(opt.num_players)
         .with_max_frames_behind(5)? // (optional) when the spectator is more than this amount of frames behind, it will catch up

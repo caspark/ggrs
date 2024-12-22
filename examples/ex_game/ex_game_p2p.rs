@@ -1,7 +1,7 @@
 mod ex_game;
 
 use ex_game::{GGRSConfig, Game};
-use ggrs::{PlayerType, SessionBuilder, UdpNonBlockingSocket};
+use ggrs::{HandshakingSocket, PlayerType, SessionBuilder, UdpNonBlockingSocket};
 use instant::{Duration, Instant};
 use macroquad::prelude::*;
 use std::net::SocketAddr;
@@ -29,6 +29,8 @@ struct Opt {
     players: Vec<String>,
     #[structopt(short, long)]
     spectators: Vec<SocketAddr>,
+    #[structopt(long)]
+    bypass_handshake: bool,
 }
 
 #[macroquad::main(window_conf)]
@@ -66,6 +68,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // GGRS must make, which is determined by prediction window, FPS and latency to clients).
         .with_sparse_saving_mode(false);
 
+    info!("Binding socket to port {}", opt.local_port);
+    let socket = UdpNonBlockingSocket::bind_to_port(opt.local_port)?;
+    // Since we're using a UDP socket, we wrap it in a HandshakingSocket to ensure our players
+    // are reachable, and to provide a tiny bit of security. If you use a different socket that
+    // provides its own handshaking and authentication, you can skip this step.
+    let mut socket = HandshakingSocket::wrap(socket);
+
     // add players
     for (i, player_addr) in opt.players.iter().enumerate() {
         // local player
@@ -75,20 +84,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // remote players
             let remote_addr: SocketAddr = player_addr.parse()?;
             sess_build = sess_build.add_player(PlayerType::Remote(remote_addr), i)?;
+            socket.register(remote_addr);
         }
     }
 
-    // optionally, add spectators
+    // Even if you do use handshaking, you don't strictly need to wait for handshaking to complete
+    // before starting the GGRS session - you can just start the session and the handshaking will
+    // happen in the background.
+    if !opt.bypass_handshake {
+        info!("Waiting for handshaking to complete with all playing players...");
+        loop {
+            if macroquad::prelude::is_key_pressed(KeyCode::Escape) {
+                info!("Escape pressed; aborting handshaking");
+                return Ok(());
+            }
+
+            socket.poll();
+            let mut completed = true;
+            for (addr, status) in socket.handshake_status() {
+                info!("Handshake status with {addr:?}: {status}");
+                completed &= status.completed();
+            }
+            if completed {
+                break;
+            }
+
+            draw_text(
+                "Handshaking - see logs for progress",
+                0.0,
+                screen_height() / 2.0 - 12.0,
+                24.0,
+                macroquad::prelude::WHITE,
+            );
+
+            next_frame().await
+        }
+    }
+
+    // optionally, add spectators; we'll never wait for handshaking to complete with them
     for (i, spec_addr) in opt.spectators.iter().enumerate() {
         sess_build = sess_build.add_player(PlayerType::Spectator(*spec_addr), num_players + i)?;
+        socket.register(*spec_addr);
     }
 
     // start the GGRS session
-    info!("binding to port");
-    let socket = UdpNonBlockingSocket::bind_to_port(opt.local_port)?;
-    info!("binding to port done");
     let mut sess = sess_build.start_p2p_session(socket)?;
-    info!("session created");
+    info!("Session started");
 
     // Create a new box game
     let mut game = Game::new(num_players);

@@ -103,11 +103,6 @@ pub(crate) struct ChecksumReport {
     pub frame: Frame,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub(crate) struct MessageHeader {
-    pub magic: u16,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MessageBody {
     Input(Input),
@@ -124,6 +119,5 @@ pub(crate) enum MessageBody {
 /// [`NonBlockingSocket`]: crate::NonBlockingSocket
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
-    pub(crate) header: MessageHeader,
     pub(crate) body: MessageBody,
 }

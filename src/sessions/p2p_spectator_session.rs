@@ -1,5 +1,7 @@
 use std::collections::{vec_deque::Drain, VecDeque};
 
+use tracing::trace;
+
 use crate::{
     error::NetworkStatsError,
     frame_info::PlayerInput,
@@ -133,8 +135,18 @@ impl<T: Config> SpectatorSession<T> {
     pub fn poll_remote_clients(&mut self) {
         // Get all udp packets and distribute them to associated endpoints.
         // The endpoints will handle their packets, which will trigger both events and UPD replies.
-        for (from, msg) in &self.socket.receive_all_messages() {
-            if self.host.is_handling_message(from) {
+        for (from_addr, buf) in &self.socket.receive_all_messages() {
+            if self.host.is_handling_message(from_addr) {
+                let Ok(msg) = &bincode::deserialize(buf.as_slice()) else {
+                    // log and drop the message, but don't assert: we don't want to allow the host
+                    // to crash us
+                    trace!(
+                        "Dropping invalid message from {:?} ({} bytes)",
+                        from_addr,
+                        buf.len(),
+                    );
+                    continue;
+                };
                 self.host.handle_message(msg);
             }
         }

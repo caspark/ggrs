@@ -12,12 +12,13 @@ use std::{fmt::Debug, hash::Hash};
 pub use error::GgrsError;
 pub use network::messages::Message;
 pub use network::network_stats::NetworkStats;
-pub use network::udp_socket::UdpNonBlockingSocket;
 use serde::{de::DeserializeOwned, Serialize};
 pub use sessions::builder::SessionBuilder;
 pub use sessions::p2p_session::P2PSession;
 pub use sessions::p2p_spectator_session::SpectatorSession;
 pub use sessions::sync_test_session::SyncTestSession;
+pub use socket::handshake::HandshakingSocket;
+pub use socket::udp::UdpNonBlockingSocket;
 pub use sync_layer::{GameStateAccessor, GameStateCell};
 
 pub(crate) mod error;
@@ -36,7 +37,10 @@ pub(crate) mod network {
     pub(crate) mod messages;
     pub(crate) mod network_stats;
     pub(crate) mod protocol;
-    pub(crate) mod udp_socket;
+}
+pub(crate) mod socket {
+    pub(crate) mod handshake;
+    pub(crate) mod udp;
 }
 
 // #############
@@ -200,6 +204,18 @@ where
 
 //  special thanks to james7132 for the idea of a config trait that bundles all generics
 
+/// A type that can be used as an address for your chosen [`NonBlockingSocket`] implementation.
+#[cfg(feature = "sync-send")]
+pub trait Address: Clone + PartialEq + Eq + Hash + Send + Sync + Debug {}
+#[cfg(feature = "sync-send")]
+impl<A> Address for A where A: Clone + PartialEq + Eq + Hash + Send + Sync + Debug {}
+
+/// A type that can be used as an address for your chosen [`NonBlockingSocket`] implementation.
+#[cfg(not(feature = "sync-send"))]
+pub trait Address: Clone + PartialEq + Eq + Hash + Debug {}
+#[cfg(not(feature = "sync-send"))]
+impl<A> Address for A where A: Clone + PartialEq + Eq + Hash + Debug {}
+
 /// Compile time parameterization for sessions.
 #[cfg(feature = "sync-send")]
 pub trait Config: 'static + Send + Sync {
@@ -214,7 +230,7 @@ pub trait Config: 'static + Send + Sync {
     type State: Clone + Send + Sync;
 
     /// The address type which identifies the remote clients
-    type Address: Clone + PartialEq + Eq + Hash + Send + Sync + Debug;
+    type Address: Address;
 }
 
 /// This [`NonBlockingSocket`] trait is used when you want to use GGRS with your own socket.
@@ -248,7 +264,7 @@ pub trait Config: 'static {
     type State;
 
     /// The address type which identifies the remote clients
-    type Address: Clone + PartialEq + Eq + Hash + Debug;
+    type Address: Address;
 }
 
 /// This [`NonBlockingSocket`] trait is used when you want to use GGRS with your own socket.
@@ -260,10 +276,10 @@ pub trait NonBlockingSocket<A>
 where
     A: Clone + PartialEq + Eq + Hash,
 {
-    /// Takes a [`Message`] and sends it to the given address.
-    fn send_to(&mut self, msg: &Message, addr: &A);
+    /// Takes some data and sends it to the given address.
+    fn send_to(&mut self, buf: &[u8], addr: &A);
 
     /// This method should return all messages received since the last time this method was called.
     /// The pairs `(A, Message)` indicate from which address each packet was received.
-    fn receive_all_messages(&mut self) -> Vec<(A, Message)>;
+    fn receive_all_messages(&mut self) -> Vec<(A, Vec<u8>)>;
 }

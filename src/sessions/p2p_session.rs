@@ -428,7 +428,17 @@ impl<T: Config> P2PSession<T> {
     pub fn poll_remote_clients(&mut self) {
         // Get all packets and distribute them to associated endpoints.
         // The endpoints will handle their packets, which will trigger both events and UPD replies.
-        for (from_addr, msg) in &self.socket.receive_all_messages() {
+        for (from_addr, buf) in &self.socket.receive_all_messages() {
+            let Ok(msg) = &bincode::deserialize(buf.as_slice()) else {
+                // log and drop the message, but don't assert: we don't want to allow remote players
+                // to crash us
+                trace!(
+                    "Dropping invalid message from {:?} ({} bytes)",
+                    from_addr,
+                    buf.len(),
+                );
+                continue;
+            };
             if let Some(endpoint) = self.player_reg.remotes.get_mut(from_addr) {
                 endpoint.handle_message(msg);
             }
