@@ -40,6 +40,7 @@ pub(crate) mod network {
 }
 pub(crate) mod socket {
     pub(crate) mod handshake;
+    pub(crate) mod memory;
     pub(crate) mod udp;
 }
 
