@@ -1,53 +1,58 @@
 use crate::NonBlockingSocket;
-use parking_lot::Mutex;
-use rand::prelude::*;
+use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use std::sync::Arc;
 
 type MemoryAddress = usize;
 type VirtualTime = u64;
 
 #[derive(Debug, Clone)]
+pub enum SocketNetworkStateChange {
+    /// Set the latency of all packets sent
+    SetLatency(VirtualTime),
+    /// Packets sent will be duplicated
+    SetDuplicating(bool),
+    /// Packets sent will be dropped
+    SetDropping(bool),
+    /// Packets received will be out of order (applied at receiving time; last packet in queue will be received first, so must have a latency greater than 0 for this to do anything)
+    SetOutOfOrderReceive(bool),
+}
+
+#[derive(Debug, Clone)]
+pub struct SocketNetworkChangeEvent {
+    time: VirtualTime,
+    change: SocketNetworkStateChange,
+}
+
+#[derive(Debug, Clone)]
 pub struct SocketConfig {
-    // Base latency in virtual milliseconds
-    latency: VirtualTime,
-    // Percentage chances (0-100)
-    loss_percent: u8,
-    corruption_percent: u8,
-    reordering_percent: u8,
-    duplication_percent: u8,
+    // Next packet sent will be delayed by this many milliseconds
+    send_latency: VirtualTime,
+    /// Drop on send
+    drop_on_send: bool,
+    /// Whether packets sent will be duplicated
+    duplicate_on_send: bool,
+    /// Whether packets received will be out of order
+    out_of_order_receiving: bool,
+    // Sequence of network events still left to apply
+    remaining_events: Vec<SocketNetworkChangeEvent>,
 }
 
 impl Default for SocketConfig {
     fn default() -> Self {
         Self {
-            latency: 0,
-            loss_percent: 0,
-            corruption_percent: 0,
-            reordering_percent: 0,
-            duplication_percent: 0,
+            send_latency: 0,
+            drop_on_send: false,
+            duplicate_on_send: false,
+            out_of_order_receiving: false,
+            remaining_events: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Clone)]
-struct NetworkState {
-    current_time: VirtualTime,
-    rng: StdRng,
-    // Map from address to its config
-    socket_configs: Vec<SocketConfig>,
-}
-
-impl NetworkState {
-    fn new(seed: u64) -> Self {
-        Self {
-            current_time: 0,
-            rng: StdRng::seed_from_u64(seed),
-            socket_configs: Vec::new(),
-        }
-    }
-
-    fn advance_time(&mut self, duration: VirtualTime) {
-        self.current_time += duration;
+impl SocketConfig {
+    pub fn set_events(&mut self, events: Vec<SocketNetworkChangeEvent>) {
+        self.remaining_events = events;
+        self.remaining_events.sort_by_key(|event| event.time);
     }
 }
 
@@ -61,79 +66,79 @@ pub(crate) struct MemoryMsg {
 
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryTransport {
-    // Messages waiting to be delivered, sorted by delivery time
+    current_time: VirtualTime,
+    /// Messages waiting to be delivered, sorted by delivery time
     pending_messages: Vec<MemoryMsg>,
-    // Network state including time and RNG
-    network_state: NetworkState,
+    socket_configs: Vec<SocketConfig>,
 }
 
 impl MemoryTransport {
-    pub(crate) fn new(seed: u64) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
+            current_time: 0,
             pending_messages: Vec::new(),
-            network_state: NetworkState::new(seed),
+            socket_configs: Vec::new(),
         }
     }
 
-    pub(crate) fn add_socket_config(&mut self, config: SocketConfig) -> MemoryAddress {
-        let addr = self.network_state.socket_configs.len();
-        self.network_state.socket_configs.push(config);
+    pub(crate) fn add_socket(&mut self, config: SocketConfig) -> MemoryAddress {
+        let addr = self.socket_configs.len();
+        self.socket_configs.push(config);
         addr
     }
 
-    fn should_drop(&mut self, from: MemoryAddress) -> bool {
-        let config = &self.network_state.socket_configs[from];
-        self.network_state.rng.gen_range(0..100) < config.loss_percent
-    }
+    pub fn advance_time(&mut self, duration: VirtualTime) {
+        self.current_time += duration;
 
-    fn should_corrupt(&mut self, from: MemoryAddress) -> bool {
-        let config = &self.network_state.socket_configs[from];
-        self.network_state.rng.gen_range(0..100) < config.corruption_percent
-    }
-
-    fn should_reorder(&mut self, from: MemoryAddress) -> bool {
-        let config = &self.network_state.socket_configs[from];
-        self.network_state.rng.gen_range(0..100) < config.reordering_percent
-    }
-
-    fn should_duplicate(&mut self, from: MemoryAddress) -> bool {
-        let config = &self.network_state.socket_configs[from];
-        self.network_state.rng.gen_range(0..100) < config.duplication_percent
-    }
-
-    fn get_latency(&mut self, from: MemoryAddress) -> VirtualTime {
-        self.network_state.socket_configs[from].latency
-    }
-
-    fn corrupt_data(&mut self, mut data: Vec<u8>) -> Vec<u8> {
-        if data.is_empty() {
-            return data;
+        for config in self.socket_configs.iter_mut() {
+            config.remaining_events.retain(|event| {
+                if event.time >= self.current_time {
+                    true
+                } else {
+                    match event.change {
+                        SocketNetworkStateChange::SetLatency(latency) => {
+                            config.send_latency = latency;
+                        }
+                        SocketNetworkStateChange::SetDuplicating(duplicating) => {
+                            config.duplicate_on_send = duplicating;
+                        }
+                        SocketNetworkStateChange::SetDropping(dropping) => {
+                            config.drop_on_send = dropping;
+                        }
+                        SocketNetworkStateChange::SetOutOfOrderReceive(out_of_order) => {
+                            config.out_of_order_receiving = out_of_order;
+                        }
+                    }
+                    false
+                }
+            });
         }
-        // Corrupt a random byte
-        let pos = self.network_state.rng.gen_range(0..data.len());
-        data[pos] = self.network_state.rng.gen();
-        data
+    }
+
+    pub fn config(&self, addr: MemoryAddress) -> &SocketConfig {
+        &self.socket_configs[addr]
+    }
+
+    pub fn config_mut(&mut self, addr: MemoryAddress) -> &mut SocketConfig {
+        &mut self.socket_configs[addr]
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryNetwork {
     transport: Arc<Mutex<MemoryTransport>>,
-    next_socket_address: MemoryAddress,
 }
 
 impl MemoryNetwork {
-    pub fn new(seed: u64) -> Self {
+    pub fn new() -> Self {
         Self {
-            transport: Arc::new(Mutex::new(MemoryTransport::new(seed))),
-            next_socket_address: 0,
+            transport: Arc::new(Mutex::new(MemoryTransport::new())),
         }
     }
 
     pub fn add_socket(&mut self, config: SocketConfig) -> MemorySocket {
         let mut transport = self.transport.lock();
-        let address = transport.add_socket_config(config);
-        self.next_socket_address = address + 1;
+        let address = transport.add_socket(config);
 
         MemorySocket {
             address,
@@ -142,7 +147,15 @@ impl MemoryNetwork {
     }
 
     pub fn num_sockets(&self) -> usize {
-        self.next_socket_address
+        self.transport.lock().socket_configs.len()
+    }
+
+    pub fn advance_time(&mut self, duration: VirtualTime) {
+        self.transport.lock().advance_time(duration);
+    }
+
+    pub fn config(&mut self, addr: MemoryAddress) -> MappedMutexGuard<SocketConfig> {
+        MutexGuard::map(self.transport.lock(), |t| t.config_mut(addr))
     }
 }
 
@@ -152,62 +165,67 @@ pub(crate) struct MemorySocket {
     transport: Arc<Mutex<MemoryTransport>>,
 }
 
+impl MemorySocket {
+    pub fn address(&self) -> MemoryAddress {
+        self.address
+    }
+
+    pub fn config_mut(&self) -> MappedMutexGuard<SocketConfig> {
+        MutexGuard::map(self.transport.lock(), |t| t.config_mut(self.address))
+    }
+}
+
 impl NonBlockingSocket<MemoryAddress> for MemorySocket {
     fn send_to(&mut self, buf: &[u8], addr: &MemoryAddress) {
         let mut transport = self.transport.lock();
+        let sender_config = transport.config(self.address);
 
-        // Check for packet loss
-        if transport.should_drop(self.address) {
+        if sender_config.drop_on_send {
             return;
         }
 
-        // Get base latency and prepare data
-        let mut data = buf.to_vec();
-        let delivery_time =
-            transport.network_state.current_time + transport.get_latency(self.address);
-
-        // Apply corruption if needed
-        if transport.should_corrupt(self.address) {
-            data = transport.corrupt_data(data);
-        }
-
-        // Create the base message
+        let delivery_time = transport.current_time + sender_config.send_latency;
         let msg = MemoryMsg {
             from: self.address,
             to: *addr,
-            data,
+            data: buf.to_vec(),
             delivery_time,
         };
 
-        // Handle duplication
-        if transport.should_duplicate(self.address) {
-            // Duplicate arrives a bit later
+        if sender_config.duplicate_on_send {
+            // Duplicate arrives at same time
             let duplicate = MemoryMsg {
-                delivery_time: delivery_time + 1,
+                delivery_time,
                 ..msg.clone()
             };
             transport.pending_messages.push(duplicate);
         }
 
-        // Handle reordering by randomly adjusting delivery time
-        let msg = if transport.should_reorder(self.address) {
-            MemoryMsg {
-                // Reordered messages arrive earlier
-                delivery_time: delivery_time.saturating_sub(2),
-                ..msg
-            }
-        } else {
-            msg
-        };
+        // (reordering is handled at receive time)
 
         transport.pending_messages.push(msg);
     }
 
     fn receive_all_messages(&mut self) -> Vec<(MemoryAddress, Vec<u8>)> {
         let mut transport = self.transport.lock();
-        let current_time = transport.network_state.current_time;
-
         let mut received = Vec::new();
+        let current_time = transport.current_time;
+
+        if transport.config(self.address).out_of_order_receiving {
+            // find the first message (starting from the end of the list of pending messages)
+            // destined for this socket and return it as the first message (ignoring the normal
+            // "delivery time" ordering)
+            let index = transport
+                .pending_messages
+                .iter()
+                .rposition(|msg| msg.to == self.address)
+                .unwrap();
+            let msg = transport.pending_messages.remove(index);
+            received.push((msg.from, msg.data));
+        }
+
+        // now handle the normal "delivery time" based ordering, where we only return messages
+        // that are destined for this socket and have a delivery time that has passed
         transport.pending_messages.retain(|msg| {
             if msg.to == self.address && msg.delivery_time <= current_time {
                 received.push((msg.from, msg.data.clone()));
@@ -217,8 +235,6 @@ impl NonBlockingSocket<MemoryAddress> for MemorySocket {
             }
         });
 
-        // Advance time by 1 unit after each receive operation
-        transport.network_state.advance_time(1);
         received
     }
 }
@@ -226,10 +242,12 @@ impl NonBlockingSocket<MemoryAddress> for MemorySocket {
 #[cfg(test)]
 mod memory_tests {
     use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
 
     #[test]
     fn test_basic_memory_socket_communication() {
-        let mut network = MemoryNetwork::new(12345);
+        let mut network = MemoryNetwork::new();
         let mut socket1 = network.add_socket(SocketConfig::default());
         let mut socket2 = network.add_socket(SocketConfig::default());
 
@@ -259,49 +277,31 @@ mod memory_tests {
         assert_eq!(received_by_socket2[0].1, message3);
     }
 
-    use proptest::collection::{hash_map, vec};
-    use proptest::prelude::*;
-    use std::collections::HashMap;
-
-    #[derive(Debug, Clone)]
-    struct MessageRecord {
-        from: MemoryAddress,
-        to: MemoryAddress,
-        data: Vec<u8>,
-        sequence: usize,
-    }
-
     proptest! {
         #[test]
-        fn test_memory_socket_comprehensive(
+        fn test_memory_socket_reliable(
             // Generate initial number of sockets (2-16)
             initial_sockets in 2..=16usize,
-            // Generate sequence of operations:
-            // (add_socket, from_socket, to_socket, message_data)
-            operations in vec(
+            // Generate sequence of send operations:
+            sends in vec(
                 (
-                    // 20% chance to add a new socket
-                    prop::bool::weighted(0.2),
                     // Source socket index
-                    any::<usize>(),
+                    any::<MemoryAddress>(),
                     // Destination socket index
-                    any::<usize>(),
+                    any::<MemoryAddress>(),
                     // Message data (max 2KB)
                     vec(any::<u8>(), 1..=2048),
                 ),
-                1..=100 // Up to 100 operations
-            )
+                1..=100 // This many operations
+            ),
         ) {
-            let mut network = MemoryNetwork::new(12345);
+            let mut network = MemoryNetwork::new();
             let mut sockets = Vec::new();
             let mut socket_addresses = Vec::new();
-            let mut expected_messages: Vec<MessageRecord> = Vec::new();
-            let mut sequence = 0usize;
 
-            // Create initial sockets with default config (no failures)
             for _ in 0..initial_sockets {
                 let socket = network.add_socket(SocketConfig::default());
-                socket_addresses.push(socket.address);
+                socket_addresses.push(socket.address());
                 sockets.push(socket);
             }
 
@@ -309,14 +309,7 @@ mod memory_tests {
             prop_assert_eq!(network.num_sockets(), initial_sockets);
 
             // Process each operation
-            for (add_socket, from_idx, to_idx, data) in operations {
-                if add_socket {
-                    let socket = network.add_socket(SocketConfig::default());
-                    socket_addresses.push(socket.address);
-                    sockets.push(socket);
-                    prop_assert_eq!(network.num_sockets(), sockets.len());
-                }
-
+            for (from_idx, to_idx, data) in sends {
                 // Ensure socket indices are valid
                 let from_idx = from_idx % sockets.len();
                 let to_idx = to_idx % sockets.len();
@@ -324,100 +317,11 @@ mod memory_tests {
                 // Send message
                 sockets[from_idx].send_to(&data, &socket_addresses[to_idx]);
 
-                // Record expected message
-                expected_messages.push(MessageRecord {
-                    from: socket_addresses[from_idx],
-                    to: socket_addresses[to_idx],
-                    data,
-                    sequence,
-                });
-                sequence += 1;
-            }
-
-            // Verify all messages are received correctly and in order
-            let mut received_by_socket: HashMap<MemoryAddress, Vec<MessageRecord>> = HashMap::new();
-
-            // Collect all received messages
-            for i in 0..sockets.len() {
-                let messages = sockets[i].receive_all_messages();
-                let socket_addr = socket_addresses[i];
-                for (from_addr, data) in messages {
-                    received_by_socket
-                        .entry(socket_addr)
-                        .or_default()
-                        .push(MessageRecord {
-                            from: from_addr,
-                            to: socket_addr,
-                            data,
-                            sequence: 0, // Will be set when matching with expected messages
-                        });
-                }
-            }
-
-            // Group expected messages by destination socket
-            let mut expected_by_socket: HashMap<MemoryAddress, Vec<&MessageRecord>> = HashMap::new();
-            for expected in expected_messages.iter() {
-                expected_by_socket
-                    .entry(expected.to)
-                    .or_default()
-                    .push(expected);
-            }
-
-            // Verify all messages were received in order for each socket
-            for (socket_addr, received_messages) in received_by_socket.iter() {
-                let expected_messages = expected_by_socket
-                    .get(socket_addr)
-                    .expect("Should have expected messages for this socket");
-
-                prop_assert_eq!(
-                    received_messages.len(),
-                    expected_messages.len(),
-                    "Socket {} received wrong number of messages", socket_addr
-                );
-
-                // Match received messages with expected ones and verify order
-                let mut last_sequence = None;
-                for received in received_messages {
-                    let matching_expected = expected_messages
-                        .iter()
-                        .find(|expected| {
-                            expected.from == received.from &&
-                            expected.to == received.to &&
-                            expected.data == received.data
-                        })
-                        .expect("Should find matching expected message");
-
-                    if let Some(last_seq) = last_sequence {
-                        prop_assert!(
-                            matching_expected.sequence > last_seq,
-                            "Messages received out of order at socket {}. Message with sequence {} came after {}",
-                            socket_addr,
-                            matching_expected.sequence,
-                            last_seq
-                        );
-                    }
-                    last_sequence = Some(matching_expected.sequence);
-                }
-            }
-
-            // Verify no unexpected messages were received
-            let total_received: usize = received_by_socket
-                .values()
-                .map(|msgs| msgs.len())
-                .sum();
-
-            prop_assert_eq!(
-                total_received,
-                expected_messages.len(),
-                "Number of received messages doesn't match expected"
-            );
-
-            // Verify all messages have been consumed
-            for i in 0..sockets.len() {
-                prop_assert!(
-                    sockets[i].receive_all_messages().is_empty(),
-                    "Socket should have no remaining messages"
-                );
+                // Verify message is received
+                let received = sockets[to_idx].receive_all_messages();
+                prop_assert_eq!(received.len(), 1);
+                prop_assert_eq!(received[0].0, socket_addresses[from_idx]);
+                prop_assert_eq!(&received[0].1, &data);
             }
         }
     }
