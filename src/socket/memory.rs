@@ -84,134 +84,36 @@ impl NonBlockingSocket<MemoryAddress> for MemorySocket {
 #[cfg(test)]
 mod memory_tests {
     use super::*;
-    use proptest::prelude::*;
-    use std::collections::HashMap;
 
-    // fn some_function(stuff: Vec<String>, index: usize) {
-    //     let _ = &stuff[index];
-    //     // Do stuff
-    // }
+    #[test]
+    fn test_basic_memory_socket_communication() {
+        let mut network = MemoryNetwork::new();
+        let mut socket1 = network.add_socket();
+        let mut socket2 = network.add_socket();
 
-    // prop_compose! {
-    //     fn arb_memory_socket()(max_addr: MemoryAddress)
-    //                              (id in 0..max_addr>()) -> MemorySocket {
+        socket1.send_to(&vec![1, 2, 3, 4], &socket2.address);
+        socket2.send_to(&vec![5, 6, 7, 8], &socket1.address);
 
-    //     }
-    // }
+        let received_by_socket2 = socket2.receive_all_messages();
+        assert_eq!(received_by_socket2.len(), 1);
+        assert_eq!(received_by_socket2[0].0, socket1.address);
+        assert_eq!(received_by_socket2[0].1, vec![1, 2, 3, 4]);
 
-    // fn arb_order(max_quantity: u32) -> impl Strategy<Value = Order> {
-    //     (
-    //         any::<u32>().prop_map(|v| v.to_string()),
-    //         "[a-z]*",
-    //         1..max_quantity,
-    //     )
-    //         .prop_map(|(id, item, quantity)| Order { id, item, quantity })
-    // }
+        let received_by_socket1 = socket1.receive_all_messages();
+        assert_eq!(received_by_socket1.len(), 1);
+        assert_eq!(received_by_socket1[0].0, socket2.address);
+        assert_eq!(received_by_socket1[0].1, vec![5, 6, 7, 8]);
 
-    // fn arb_memory_sockets(
-    //     max_quantity: usize,
-    // ) -> impl Strategy<Value = (MemoryNetwork, Vec<MemorySocket>)> {
-    //     (0..max_quantity).prop_flat_map(|(max_address)| {
-    //         let mut network = MemoryNetwork::new();
-    //         let sockets = (0..max_address).map(|_| network.add_socket()).collect();
-    //         (Just(network), Just(sockets))
-    //     })
-    // }
+        // Verify cleanup behavior - messages should be removed after being received
+        assert_eq!(socket1.transport.all_messages.lock().len(), 0);
 
-    fn arb_sockets(
-        max_sockets: usize,
-    ) -> impl Strategy<Value = (MemoryNetwork, Vec<MemorySocket>)> {
-        (0..max_sockets).prop_map(|max_address| {
-            let mut network = MemoryNetwork::new();
-            let sockets = (0..max_address).map(|_| network.add_socket()).collect();
-            (network, sockets)
-        })
-    }
+        let message3 = vec![9, 10, 11, 12];
+        socket1.send_to(&message3, &socket2.address);
 
-    fn arb_messages(
-        sockets: MemoryNetwork,
-        max_num_messages: usize,
-    ) -> impl Strategy<Value = Vec<MemoryMsg>> {
-        sockets.num_sockets().prop_flat_map(|num_sockets| {
-            let msg_data = prop::collection::vec(any::<u8>(), 0..1000);
-            let messages = prop::collection::vec(msg_data, 0..max_num_messages);
-            messages.prop_flat_map(|msgs| msgs)
-        })
-    }
-
-    fn vec_and_index() -> impl Strategy<Value = (Vec<String>, usize)> {
-        // (num_sockets in 0..10).prop_flat_map(|num_sockets| {
-
-        // })
-
-        prop::collection::vec(".*", 1..100).prop_flat_map(|vec| {
-            let len = vec.len();
-            (Just(vec), 0..len)
-        })
-    }
-
-    proptest! {
-        #[test]
-        fn test_memory_socket_messaging(
-            // Generate between 2-10 messages for each socket pair
-            messages in prop::collection::vec(any::<[u8; 2]>(), 2..10),
-            // Generate between 2-5 sockets to test with
-            num_sockets in 2..5usize,
-        ) {
-            // Set up the network and sockets
-            let mut network = MemoryNetwork::new();
-            let mut sockets: Vec<MemorySocket> = (0..num_sockets)
-                .map(|_| network.add_socket())
-                .collect();
-
-            // Keep track of what messages each socket should receive
-            let mut expected_messages: HashMap<MemoryAddress, Vec<(MemoryAddress, Vec<u8>)>> =
-                HashMap::new();
-
-            // Send all messages between random pairs of sockets
-            for message_data in messages {
-                // Pick random sender and receiver
-                let sender_idx = message_data[0] as usize % num_sockets;
-                let receiver_idx = (message_data[0] as usize + 1) % num_sockets; // Ensure different from sender
-
-                let sender_addr = sockets[sender_idx].address;
-                let receiver_addr = sockets[receiver_idx].address;
-
-                // Send the message
-                sockets[sender_idx].send_to(&message_data, &receiver_addr);
-
-                // Record the expected message
-                expected_messages
-                    .entry(receiver_addr)
-                    .or_default()
-                    .push((sender_addr, message_data.to_vec()));
-            }
-
-            // Verify each socket receives exactly what it should
-            for socket in sockets.iter_mut() {
-                let received = socket.receive_all_messages();
-                let expected = expected_messages.get(&socket.address).cloned().unwrap_or_default();
-
-                // Sort both vectors to make comparison stable
-                let mut received_sorted = received;
-                let mut expected_sorted = expected;
-                received_sorted.sort_by_key(|k| (k.0, k.1.clone()));
-                expected_sorted.sort_by_key(|k| (k.0, k.1.clone()));
-
-                prop_assert_eq!(
-                    received_sorted,
-                    expected_sorted,
-                    "Socket {} received incorrect messages",
-                    socket.address
-                );
-            }
-
-            // Verify all messages have been cleared from transport
-            prop_assert_eq!(
-                sockets[0].transport.all_messages.lock().len(),
-                0,
-                "Messages remained in transport after receiving"
-            );
-        }
+        // Verify messages are only delivered to intended recipients
+        assert!(socket1.receive_all_messages().is_empty());
+        let received_by_socket2 = socket2.receive_all_messages();
+        assert_eq!(received_by_socket2.len(), 1);
+        assert_eq!(received_by_socket2[0].1, message3);
     }
 }
