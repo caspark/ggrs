@@ -13,7 +13,8 @@ pub enum SocketNetworkStateChange {
     SetDuplicating(bool),
     /// Packets sent will be dropped
     SetDropping(bool),
-    /// Packets received will be out of order (applied at receiving time; last packet in queue will be received first, so must have a latency greater than 0 for this to do anything)
+    /// Packets received will be out of order (applied at receiving time; last packet in queue will
+    /// be received first, so must have a latency greater than 0 for this to do anything)
     SetOutOfOrderReceive(bool),
 }
 
@@ -244,6 +245,155 @@ mod memory_tests {
     use super::*;
     use proptest::collection::vec;
     use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    struct TestMessage {
+        seq_num: u64,
+        data: Vec<u8>,
+        should_drop: bool,
+        can_duplicate: bool,
+        expected_delivery_time: VirtualTime,
+        to: MemoryAddress,
+    }
+
+    prop_compose! {
+        fn arb_network_event(max_time: VirtualTime)(
+            time in 0..=max_time,
+            change in prop_oneof![
+                any::<VirtualTime>().prop_map(SocketNetworkStateChange::SetLatency),
+                Just(true).prop_map(SocketNetworkStateChange::SetDropping),
+                Just(false).prop_map(SocketNetworkStateChange::SetDropping),
+                Just(true).prop_map(SocketNetworkStateChange::SetDuplicating),
+                Just(false).prop_map(SocketNetworkStateChange::SetDuplicating)
+            ]
+        ) -> SocketNetworkChangeEvent {
+            SocketNetworkChangeEvent { time, change }
+        }
+    }
+
+    proptest! {
+        //FIXME this test fails if latency is set to 1001 - probably need to have a configured max latency for arb_network_event!
+        //TODO create an arb for a network with N sockets, with configurable latency, duplication, dropping, and out-of-order receiving
+        #[test]
+        fn test_network_state_changes(// // Generate 2-4 sockets
+                num_sockets in 2..=4usize,
+                // Generate up to 10 network events with max time of 1000
+                events in vec(arb_network_event(1000), 0..10),
+                // Generate up to 20 messages
+                messages in vec(
+                    (
+                        // Source socket index
+                        any::<MemoryAddress>(),
+                        // Destination socket index
+                        any::<MemoryAddress>(),
+                        // Message data (1-100 bytes)
+                        vec(any::<u8>(), 1..=100),
+                        // Send time (0-1000)
+                        0..=1000u64
+                    ),
+                    0..20
+                )
+        ) {
+            let mut network = MemoryNetwork::new();
+            let mut sockets = Vec::new();
+            let mut socket_addresses = Vec::new();
+
+            // Create sockets
+            for _ in 0..num_sockets {
+                let socket = network.add_socket(SocketConfig::default());
+                socket_addresses.push(socket.address());
+                sockets.push(socket);
+            }
+
+            // Set up network events
+            for socket in sockets.iter_mut() {
+                socket.config_mut().set_events(events.clone());
+            }
+
+            // Track expected messages
+            let mut expected_messages: Vec<TestMessage> = Vec::new();
+            let mut next_seq = 0u64;
+
+            // Process messages in time order
+            let mut time_events: Vec<(VirtualTime, Vec<u8>, usize, usize)> = messages
+                .into_iter()
+                .map(|(from, to, data, time)| (time, data, from % num_sockets, to % num_sockets))
+                .collect();
+            time_events.sort_by_key(|&(t, _, _, _)| t);
+
+            let mut current_time = 0;
+            for (send_time, data, from_idx, to_idx) in time_events {
+                eprintln!("Sending message at time {}", send_time);
+
+                // Advance time if needed
+                if send_time > current_time {
+                    network.advance_time(send_time - current_time);
+                    current_time = send_time;
+                }
+
+                let test_msg = {
+                    // Get current network state for sending socket
+                    let sender_config = network.config(socket_addresses[from_idx]);
+
+                    // Create test message with expected behavior
+                    TestMessage {
+                        seq_num: next_seq,
+                        data: data.clone(),
+                        should_drop: sender_config.drop_on_send,
+                        can_duplicate: sender_config.duplicate_on_send,
+                        expected_delivery_time: current_time + sender_config.send_latency,
+                        to: socket_addresses[to_idx],
+                    }
+                };
+
+                // Send the message
+                sockets[from_idx].send_to(&data, &socket_addresses[to_idx]);
+
+                if !test_msg.should_drop {
+                    expected_messages.push(test_msg.clone());
+                    if test_msg.can_duplicate {
+                        expected_messages.push(test_msg);
+                    }
+                }
+
+                next_seq += 1;
+            }
+
+            // Advance to final time to ensure all messages are delivered
+            network.advance_time(1000);
+
+            // Verify received messages match expectations
+            for (socket_idx, socket) in sockets.iter_mut().enumerate() {
+                let received = socket.receive_all_messages();
+
+                // Get expected messages for this socket
+                let mut expected: Vec<_> = expected_messages
+                    .iter()
+                    .filter(|msg| socket_addresses[socket_idx] == msg.to)
+                    .collect();
+                expected.sort_by_key(|msg| msg.expected_delivery_time);
+
+                // Verify received messages match expected
+                prop_assert_eq!(
+                    received.len(),
+                    expected.len(),
+                    "Socket {} received {} messages but expected {}",
+                    socket_idx,
+                    received.len(),
+                    expected.len()
+                );
+
+                for (recv, exp) in received.iter().zip(expected.iter()) {
+                    prop_assert_eq!(
+                        &recv.1,
+                        &exp.data,
+                        "Socket {} received unexpected message data",
+                        socket_idx
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_basic_memory_socket_communication() {
