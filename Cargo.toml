@@ -37,6 +37,12 @@ tracing-subscriber = "0.3"
 tracing-log = "0.2"
 proptest = "1.6.0"
 
+# make proptest and rand_chacha run faster
+[profile.test.package.proptest]
+opt-level = 3
+[profile.test.package.rand_chacha]
+opt-level = 3
+
 # Examples
 [[example]]
 name = "ex_game_p2p"

@@ -1,8 +1,8 @@
-use std::{ops::Deref, sync::Arc};
-
-use parking_lot::Mutex;
-
 use crate::NonBlockingSocket;
+use parking_lot::Mutex;
+use std::sync::Arc;
+
+type MemoryAddress = usize;
 
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryMsg {
@@ -24,6 +24,7 @@ impl MemoryTransport {
     }
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct MemoryNetwork {
     transport: MemoryTransport,
     next_socket_address: MemoryAddress,
@@ -34,6 +35,10 @@ impl MemoryNetwork {
             transport: MemoryTransport::new(),
             next_socket_address: 0,
         }
+    }
+
+    pub fn num_sockets(&self) -> usize {
+        self.next_socket_address
     }
 
     pub fn add_socket(&mut self) -> MemorySocket {
@@ -47,8 +52,7 @@ impl MemoryNetwork {
     }
 }
 
-type MemoryAddress = usize;
-
+#[derive(Debug)]
 pub(crate) struct MemorySocket {
     address: MemoryAddress,
     transport: MemoryTransport,
@@ -82,6 +86,69 @@ mod memory_tests {
     use super::*;
     use proptest::prelude::*;
     use std::collections::HashMap;
+
+    // fn some_function(stuff: Vec<String>, index: usize) {
+    //     let _ = &stuff[index];
+    //     // Do stuff
+    // }
+
+    // prop_compose! {
+    //     fn arb_memory_socket()(max_addr: MemoryAddress)
+    //                              (id in 0..max_addr>()) -> MemorySocket {
+
+    //     }
+    // }
+
+    // fn arb_order(max_quantity: u32) -> impl Strategy<Value = Order> {
+    //     (
+    //         any::<u32>().prop_map(|v| v.to_string()),
+    //         "[a-z]*",
+    //         1..max_quantity,
+    //     )
+    //         .prop_map(|(id, item, quantity)| Order { id, item, quantity })
+    // }
+
+    // fn arb_memory_sockets(
+    //     max_quantity: usize,
+    // ) -> impl Strategy<Value = (MemoryNetwork, Vec<MemorySocket>)> {
+    //     (0..max_quantity).prop_flat_map(|(max_address)| {
+    //         let mut network = MemoryNetwork::new();
+    //         let sockets = (0..max_address).map(|_| network.add_socket()).collect();
+    //         (Just(network), Just(sockets))
+    //     })
+    // }
+
+    fn arb_sockets(
+        max_sockets: usize,
+    ) -> impl Strategy<Value = (MemoryNetwork, Vec<MemorySocket>)> {
+        (0..max_sockets).prop_map(|max_address| {
+            let mut network = MemoryNetwork::new();
+            let sockets = (0..max_address).map(|_| network.add_socket()).collect();
+            (network, sockets)
+        })
+    }
+
+    fn arb_messages(
+        sockets: MemoryNetwork,
+        max_num_messages: usize,
+    ) -> impl Strategy<Value = Vec<MemoryMsg>> {
+        sockets.num_sockets().prop_flat_map(|num_sockets| {
+            let msg_data = prop::collection::vec(any::<u8>(), 0..1000);
+            let messages = prop::collection::vec(msg_data, 0..max_num_messages);
+            messages.prop_flat_map(|msgs| msgs)
+        })
+    }
+
+    fn vec_and_index() -> impl Strategy<Value = (Vec<String>, usize)> {
+        // (num_sockets in 0..10).prop_flat_map(|num_sockets| {
+
+        // })
+
+        prop::collection::vec(".*", 1..100).prop_flat_map(|vec| {
+            let len = vec.len();
+            (Just(vec), 0..len)
+        })
+    }
 
     proptest! {
         #[test]

@@ -393,3 +393,36 @@ impl<A: Address, S: NonBlockingSocket<A>> NonBlockingSocket<A> for HandshakingSo
             .collect()
     }
 }
+
+//TODO write some tests for this bad boy
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+
+
+        // #[test]
+        // fn encode_decode_round_trip(
+        //     reference in prop::collection::vec(any::<u8>(), 0..32),
+        //     inputs in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..32), 0..32)
+        // ) {
+        //     let encoded = encode(&reference, inputs.iter().map(|x| x.as_slice()).collect());
+        //     let decoded = decode(&reference, &encoded).unwrap();
+
+        //     assert_eq!(inputs, decoded, "original input (left) should match decoded (right)");
+        // }
+
+        // #[test]
+        // fn decode_arbitrary_input_never_panics(
+        //     reference in prop::collection::vec(any::<u8>(), 0..2048),
+        //     bytes in prop::collection::vec(any::<u8>(), 0..2048)
+        // ) {
+        //     // it's important that we never panic when decoding arbitrary input since input bytes
+        //     // can be received from attackers - we should just return an error instead
+        //     let _ = decode(&reference, &bytes);
+        // }
+    }
+}
