@@ -13,26 +13,27 @@ pub(crate) struct MemoryMsg {
 
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryTransport {
-    all_messages: Arc<Mutex<Vec<MemoryMsg>>>,
+    all_messages: Vec<MemoryMsg>,
 }
 
 impl MemoryTransport {
     pub(crate) fn new() -> Self {
         Self {
-            all_messages: Arc::new(Mutex::new(Vec::new())),
+            all_messages: Vec::new(),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryNetwork {
-    transport: MemoryTransport,
+    transport: Arc<Mutex<MemoryTransport>>,
     next_socket_address: MemoryAddress,
 }
+
 impl MemoryNetwork {
     pub fn new() -> Self {
         Self {
-            transport: MemoryTransport::new(),
+            transport: Arc::new(Mutex::new(MemoryTransport::new())),
             next_socket_address: 0,
         }
     }
@@ -55,12 +56,12 @@ impl MemoryNetwork {
 #[derive(Debug)]
 pub(crate) struct MemorySocket {
     address: MemoryAddress,
-    transport: MemoryTransport,
+    transport: Arc<Mutex<MemoryTransport>>,
 }
 
 impl NonBlockingSocket<MemoryAddress> for MemorySocket {
     fn send_to(&mut self, buf: &[u8], addr: &MemoryAddress) {
-        self.transport.all_messages.lock().push(MemoryMsg {
+        self.transport.lock().all_messages.push(MemoryMsg {
             from: self.address,
             to: *addr,
             data: buf.to_vec(),
@@ -69,7 +70,7 @@ impl NonBlockingSocket<MemoryAddress> for MemorySocket {
 
     fn receive_all_messages(&mut self) -> Vec<(MemoryAddress, Vec<u8>)> {
         let mut received = Vec::new();
-        self.transport.all_messages.lock().retain(|msg| {
+        self.transport.lock().all_messages.retain(|msg| {
             if msg.to == self.address {
                 received.push((msg.from, msg.data.clone()));
                 false
@@ -105,7 +106,7 @@ mod memory_tests {
         assert_eq!(received_by_socket1[0].1, vec![5, 6, 7, 8]);
 
         // Verify cleanup behavior - messages should be removed after being received
-        assert_eq!(socket1.transport.all_messages.lock().len(), 0);
+        assert_eq!(socket1.transport.lock().all_messages.len(), 0);
 
         let message3 = vec![9, 10, 11, 12];
         socket1.send_to(&message3, &socket2.address);
