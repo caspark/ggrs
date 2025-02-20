@@ -1,26 +1,118 @@
 use crate::NonBlockingSocket;
 use parking_lot::Mutex;
+use rand::prelude::*;
 use std::sync::Arc;
 
 type MemoryAddress = usize;
+type VirtualTime = u64;
+
+#[derive(Debug, Clone)]
+pub struct SocketConfig {
+    // Base latency in virtual milliseconds
+    latency: VirtualTime,
+    // Percentage chances (0-100)
+    loss_percent: u8,
+    corruption_percent: u8,
+    reordering_percent: u8,
+    duplication_percent: u8,
+}
+
+impl Default for SocketConfig {
+    fn default() -> Self {
+        Self {
+            latency: 0,
+            loss_percent: 0,
+            corruption_percent: 0,
+            reordering_percent: 0,
+            duplication_percent: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NetworkState {
+    current_time: VirtualTime,
+    rng: StdRng,
+    // Map from address to its config
+    socket_configs: Vec<SocketConfig>,
+}
+
+impl NetworkState {
+    fn new(seed: u64) -> Self {
+        Self {
+            current_time: 0,
+            rng: StdRng::seed_from_u64(seed),
+            socket_configs: Vec::new(),
+        }
+    }
+
+    fn advance_time(&mut self, duration: VirtualTime) {
+        self.current_time += duration;
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryMsg {
     from: MemoryAddress,
     to: MemoryAddress,
     data: Vec<u8>,
+    delivery_time: VirtualTime,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryTransport {
-    all_messages: Vec<MemoryMsg>,
+    // Messages waiting to be delivered, sorted by delivery time
+    pending_messages: Vec<MemoryMsg>,
+    // Network state including time and RNG
+    network_state: NetworkState,
 }
 
 impl MemoryTransport {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self {
-            all_messages: Vec::new(),
+            pending_messages: Vec::new(),
+            network_state: NetworkState::new(seed),
         }
+    }
+
+    pub(crate) fn add_socket_config(&mut self, config: SocketConfig) -> MemoryAddress {
+        let addr = self.network_state.socket_configs.len();
+        self.network_state.socket_configs.push(config);
+        addr
+    }
+
+    fn should_drop(&mut self, from: MemoryAddress) -> bool {
+        let config = &self.network_state.socket_configs[from];
+        self.network_state.rng.gen_range(0..100) < config.loss_percent
+    }
+
+    fn should_corrupt(&mut self, from: MemoryAddress) -> bool {
+        let config = &self.network_state.socket_configs[from];
+        self.network_state.rng.gen_range(0..100) < config.corruption_percent
+    }
+
+    fn should_reorder(&mut self, from: MemoryAddress) -> bool {
+        let config = &self.network_state.socket_configs[from];
+        self.network_state.rng.gen_range(0..100) < config.reordering_percent
+    }
+
+    fn should_duplicate(&mut self, from: MemoryAddress) -> bool {
+        let config = &self.network_state.socket_configs[from];
+        self.network_state.rng.gen_range(0..100) < config.duplication_percent
+    }
+
+    fn get_latency(&mut self, from: MemoryAddress) -> VirtualTime {
+        self.network_state.socket_configs[from].latency
+    }
+
+    fn corrupt_data(&mut self, mut data: Vec<u8>) -> Vec<u8> {
+        if data.is_empty() {
+            return data;
+        }
+        // Corrupt a random byte
+        let pos = self.network_state.rng.gen_range(0..data.len());
+        data[pos] = self.network_state.rng.gen();
+        data
     }
 }
 
@@ -31,25 +123,26 @@ pub(crate) struct MemoryNetwork {
 }
 
 impl MemoryNetwork {
-    pub fn new() -> Self {
+    pub fn new(seed: u64) -> Self {
         Self {
-            transport: Arc::new(Mutex::new(MemoryTransport::new())),
+            transport: Arc::new(Mutex::new(MemoryTransport::new(seed))),
             next_socket_address: 0,
         }
     }
 
-    pub fn num_sockets(&self) -> usize {
-        self.next_socket_address
-    }
-
-    pub fn add_socket(&mut self) -> MemorySocket {
-        let address = self.next_socket_address;
-        self.next_socket_address += 1;
+    pub fn add_socket(&mut self, config: SocketConfig) -> MemorySocket {
+        let mut transport = self.transport.lock();
+        let address = transport.add_socket_config(config);
+        self.next_socket_address = address + 1;
 
         MemorySocket {
             address,
             transport: self.transport.clone(),
         }
+    }
+
+    pub fn num_sockets(&self) -> usize {
+        self.next_socket_address
     }
 }
 
@@ -61,23 +154,71 @@ pub(crate) struct MemorySocket {
 
 impl NonBlockingSocket<MemoryAddress> for MemorySocket {
     fn send_to(&mut self, buf: &[u8], addr: &MemoryAddress) {
-        self.transport.lock().all_messages.push(MemoryMsg {
+        let mut transport = self.transport.lock();
+
+        // Check for packet loss
+        if transport.should_drop(self.address) {
+            return;
+        }
+
+        // Get base latency and prepare data
+        let mut data = buf.to_vec();
+        let delivery_time =
+            transport.network_state.current_time + transport.get_latency(self.address);
+
+        // Apply corruption if needed
+        if transport.should_corrupt(self.address) {
+            data = transport.corrupt_data(data);
+        }
+
+        // Create the base message
+        let msg = MemoryMsg {
             from: self.address,
             to: *addr,
-            data: buf.to_vec(),
-        });
+            data,
+            delivery_time,
+        };
+
+        // Handle duplication
+        if transport.should_duplicate(self.address) {
+            // Duplicate arrives a bit later
+            let duplicate = MemoryMsg {
+                delivery_time: delivery_time + 1,
+                ..msg.clone()
+            };
+            transport.pending_messages.push(duplicate);
+        }
+
+        // Handle reordering by randomly adjusting delivery time
+        let msg = if transport.should_reorder(self.address) {
+            MemoryMsg {
+                // Reordered messages arrive earlier
+                delivery_time: delivery_time.saturating_sub(2),
+                ..msg
+            }
+        } else {
+            msg
+        };
+
+        transport.pending_messages.push(msg);
     }
 
     fn receive_all_messages(&mut self) -> Vec<(MemoryAddress, Vec<u8>)> {
+        let mut transport = self.transport.lock();
+        let current_time = transport.network_state.current_time;
+
         let mut received = Vec::new();
-        self.transport.lock().all_messages.retain(|msg| {
-            if msg.to == self.address {
+        transport.pending_messages.retain(|msg| {
+            if msg.to == self.address && msg.delivery_time <= current_time {
                 received.push((msg.from, msg.data.clone()));
                 false
             } else {
                 true
             }
         });
+
+        // Advance time by 1 unit after each receive operation
+        transport.network_state.advance_time(1);
         received
     }
 }
@@ -88,9 +229,9 @@ mod memory_tests {
 
     #[test]
     fn test_basic_memory_socket_communication() {
-        let mut network = MemoryNetwork::new();
-        let mut socket1 = network.add_socket();
-        let mut socket2 = network.add_socket();
+        let mut network = MemoryNetwork::new(12345);
+        let mut socket1 = network.add_socket(SocketConfig::default());
+        let mut socket2 = network.add_socket(SocketConfig::default());
 
         socket1.send_to(&vec![1, 2, 3, 4], &socket2.address);
         socket2.send_to(&vec![5, 6, 7, 8], &socket1.address);
@@ -106,7 +247,7 @@ mod memory_tests {
         assert_eq!(received_by_socket1[0].1, vec![5, 6, 7, 8]);
 
         // Verify cleanup behavior - messages should be removed after being received
-        assert_eq!(socket1.transport.lock().all_messages.len(), 0);
+        assert_eq!(socket1.transport.lock().pending_messages.len(), 0);
 
         let message3 = vec![9, 10, 11, 12];
         socket1.send_to(&message3, &socket2.address);
@@ -151,15 +292,15 @@ mod memory_tests {
                 1..=100 // Up to 100 operations
             )
         ) {
-            let mut network = MemoryNetwork::new();
+            let mut network = MemoryNetwork::new(12345);
             let mut sockets = Vec::new();
             let mut socket_addresses = Vec::new();
             let mut expected_messages: Vec<MessageRecord> = Vec::new();
             let mut sequence = 0usize;
 
-            // Create initial sockets
+            // Create initial sockets with default config (no failures)
             for _ in 0..initial_sockets {
-                let socket = network.add_socket();
+                let socket = network.add_socket(SocketConfig::default());
                 socket_addresses.push(socket.address);
                 sockets.push(socket);
             }
@@ -170,7 +311,7 @@ mod memory_tests {
             // Process each operation
             for (add_socket, from_idx, to_idx, data) in operations {
                 if add_socket {
-                    let socket = network.add_socket();
+                    let socket = network.add_socket(SocketConfig::default());
                     socket_addresses.push(socket.address);
                     sockets.push(socket);
                     prop_assert_eq!(network.num_sockets(), sockets.len());
